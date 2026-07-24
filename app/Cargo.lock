@@ -2359,18 +2359,20 @@ dependencies = [
 
 [[package]]
 name = "mdm"
-version = "0.1.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "chrono",
  "dirs 5.0.1",
  "eframe",
  "futures-util",
+ "raw-window-handle",
  "reqwest",
  "serde",
  "serde_json",
  "tokio",
  "tray-icon",
+ "windows-sys 0.59.0",
  "winreg",
 ]
 

@@ -128,6 +128,10 @@ pub struct AppState {
     pub downloads: Mutex<Vec<Arc<Download>>>,
     pub log: Mutex<Vec<String>>,
     pub show_window: AtomicBool,
+    pub quit: AtomicBool,
+    /// HWND della finestra principale: serve per riaprirla quando egui è
+    /// congelato (finestra nascosta = niente WM_PAINT = niente update()).
+    pub hwnd: std::sync::atomic::AtomicIsize,
     pub egui_ctx: Mutex<Option<eframe::egui::Context>>,
     pub rt: Mutex<Option<tokio::runtime::Handle>>,
     /// memoria per host (solo sessione): quante connessioni ha tollerato l'ultima volta
@@ -153,6 +157,30 @@ impl AppState {
         }
     }
 
+    /// Mostra la finestra anche se egui è congelato (nascosta in tray).
+    /// ShowWindow via Win32 forza il WM_PAINT che risveglia il loop.
+    pub fn wake_and_show(&self) {
+        self.show_window.store(true, Ordering::Relaxed);
+        #[cfg(windows)]
+        {
+            let hwnd = self.hwnd.load(Ordering::Relaxed);
+            if hwnd != 0 {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    IsIconic, SetForegroundWindow, ShowWindow, SW_RESTORE, SW_SHOW,
+                };
+                unsafe {
+                    if IsIconic(hwnd as _) != 0 {
+                        ShowWindow(hwnd as _, SW_RESTORE);
+                    } else {
+                        ShowWindow(hwnd as _, SW_SHOW);
+                    }
+                    SetForegroundWindow(hwnd as _);
+                }
+            }
+        }
+        self.repaint();
+    }
+
     fn new_download(&self, job: Job) -> Arc<Download> {
         Arc::new(Download {
             id: self.next_id.fetch_add(1, Ordering::Relaxed),
@@ -172,11 +200,22 @@ impl AppState {
 }
 
 pub async fn run_job(state: Arc<AppState>, job: Job) {
+    // stesso URL già in coda/attivo: niente doppioni dall'estensione
+    {
+        let dup = state.downloads.lock().unwrap().iter().any(|d| {
+            d.job.lock().unwrap().url == job.url
+                && matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting | Status::Paused)
+        });
+        if dup {
+            state.log(format!("ignorato (già in lista): {}", job.url));
+            state.wake_and_show();
+            return;
+        }
+    }
     let dl = state.new_download(job.clone());
     state.downloads.lock().unwrap().push(dl.clone());
     state.log(format!("nuovo job: {}", job.url));
-    state.show_window.store(true, Ordering::Relaxed);
-    state.repaint();
+    state.wake_and_show();
 
     let result = download(&state, &dl, &job, true).await;
     finish(&state, &dl, result);
@@ -738,8 +777,11 @@ async fn fetch_segment(
         return Err(SegErr::Other(anyhow::anyhow!("range rifiutato dal server (status {})", resp.status())));
     }
 
-    let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
-    file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut raw = tokio::fs::OpenOptions::new().write(true).open(path).await?;
+    raw.seek(std::io::SeekFrom::Start(start)).await?;
+    // buffer da 512KB: molti meno syscall, pattern disco sequenziale.
+    // CRASH_REWIND (2MB) copre abbondantemente quanto può restare in buffer.
+    let mut file = tokio::io::BufWriter::with_capacity(512 * 1024, raw);
     let mut pos = start;
     let mut stream = resp.bytes_stream();
     loop {
@@ -802,7 +844,7 @@ async fn single_stream(
     }
 
     let seg = dl.segs.lock().unwrap().first().cloned();
-    let mut file = tokio::fs::File::create(part).await?;
+    let mut file = tokio::io::BufWriter::with_capacity(512 * 1024, tokio::fs::File::create(part).await?);
     let mut written = 0u64;
     let mut stream = resp.bytes_stream();
     loop {
