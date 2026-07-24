@@ -13,7 +13,7 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 const MAX_SEGMENTS: u64 = 8;
 const MIN_SEGMENT: u64 = 4 * 1024 * 1024;
-const SEGMENT_RETRIES: u32 = 3;
+const SEGMENT_RETRIES: u32 = 5;
 const SIDECAR_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
 // dopo un crash gli ultimi write potrebbero non essere arrivati su disco
 // (buffer interno di tokio::fs::File): al ripristino arretriamo ogni segmento
@@ -258,13 +258,26 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
 
     // probe: GET con Range 0-0. 206 => range supportati + totale da Content-Range;
     // 200 => niente range, ma la risposta è il file intero e la riusiamo come stream.
-    let probe = client
+    let mut probe = client
         .get(&job.url)
         .headers(headers.clone())
         .header(RANGE, "bytes=0-0")
         .send()
         .await
         .context("connessione fallita")?;
+    for attempt in 1..=2u64 {
+        if probe.status().as_u16() != 429 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(2500 * attempt)).await;
+        probe = client
+            .get(&job.url)
+            .headers(headers.clone())
+            .header(RANGE, "bytes=0-0")
+            .send()
+            .await
+            .context("connessione fallita")?;
+    }
     anyhow::ensure!(probe.status().is_success(), "status {}", probe.status());
 
     let disp_name = probe
@@ -327,7 +340,11 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
         drop(f);
         run_segments(&client, &job.url, &headers, &part, dl).await?;
     } else {
-        state.log("stream singolo (il server non supporta Range)".to_string());
+        state.log(if ranges {
+            "stream singolo (file piccolo)".to_string()
+        } else {
+            "stream singolo (il server non supporta Range)".to_string()
+        });
         *dl.segs.lock().unwrap() = vec![Arc::new(Seg {
             start: 0,
             end: len.unwrap_or(1).saturating_sub(1),
@@ -422,6 +439,9 @@ async fn run_segments(
     let _ = write_sidecar(dl, part);
 
     let segs = dl.segs.lock().unwrap().clone();
+    // se il server risponde 429 (troppe connessioni) riduciamo la concorrenza:
+    // ogni 429 "brucia" un permesso, da 8 connessioni si può scendere fino a 1
+    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_SEGMENTS as usize));
     let mut tasks = Vec::new();
     for seg in segs {
         if seg.done.load(Ordering::Relaxed) >= seg.len() {
@@ -432,18 +452,27 @@ async fn run_segments(
         let headers = headers.clone();
         let path = part.to_path_buf();
         let dl = dl.clone();
+        let sem = sem.clone();
         tasks.push(tokio::spawn(async move {
+            let _permit = sem.clone().acquire_owned().await;
             let mut last_err = anyhow::anyhow!("segmento non avviato");
             for attempt in 0..SEGMENT_RETRIES {
                 if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
                     bail!("interrotto");
                 }
-                if attempt > 0 {
-                    tokio::time::sleep(std::time::Duration::from_millis(800 * attempt as u64)).await;
-                }
                 match fetch_segment(&client, &url, &headers, &path, &seg, &dl).await {
                     Ok(()) => return Ok(()),
-                    Err(e) => last_err = e,
+                    Err(e) => {
+                        let rate_limited = format!("{e:#}").contains("429");
+                        if rate_limited {
+                            if let Ok(extra) = sem.clone().try_acquire_owned() {
+                                extra.forget(); // una connessione in meno, per sempre
+                            }
+                        }
+                        let ms = if rate_limited { 2500 * (attempt as u64 + 1) } else { 800 * (attempt as u64 + 1) };
+                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
+                        last_err = e;
+                    }
                 }
             }
             Err(last_err)
