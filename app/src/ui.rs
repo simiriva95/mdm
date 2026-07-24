@@ -57,6 +57,15 @@ pub fn run(state: Arc<AppState>) -> eframe::Result {
                     }
                 }
             }
+            for line in [
+                r" __  __ ____  __  __ ",
+                r"|  \/  |  _ \|  \/  |",
+                r"| |\/| | | | | |\/| |",
+                r"| |  | | |_| | |  | |",
+                r"|_|  |_|____/|_|  |_|",
+            ] {
+                state.log(line);
+            }
             state.log(format!("MDM v{} pronto — in ascolto su 127.0.0.1:48666", env!("CARGO_PKG_VERSION")));
             Ok(Box::new(App::new(state, &cc.egui_ctx)))
         }),
@@ -286,6 +295,32 @@ impl eframe::App for App {
                     };
                     ui.label(RichText::new(format!("port 48666  ")).color(DESK_TEXT));
                     ui.label(RichText::new(txt).color(dot));
+
+                    // update disponibile: tag lampeggiante, click = installa
+                    let upd = self.state.update.lock().unwrap().as_ref().map(|u| u.version.clone());
+                    if let Some(ver) = upd {
+                        let t = ctx.input(|i| i.time);
+                        let busy = self.state.updating.load(Ordering::Relaxed);
+                        let label = if busy { "[ aggiorno... ]".to_string() } else { format!("[ ⇡ update {ver} ]") };
+                        let color = if busy || (t * 2.0) as u64 % 2 == 0 { AMBER } else { DESK_TEXT };
+                        ui.add_space(8.0);
+                        if ui
+                            .add(
+                                egui::Button::new(RichText::new(label).color(DESK_TEXT))
+                                    .fill(if color == AMBER { AMBER } else { DESK_TAG_OFF })
+                                    .stroke(Stroke::new(1.0, DESK_TEXT))
+                                    .rounding(Rounding::same(2.0)),
+                            )
+                            .on_hover_text("scarica e installa la nuova versione, poi riavvia")
+                            .clicked()
+                            && !busy
+                        {
+                            let rt = self.state.rt.lock().unwrap().clone();
+                            if let Some(rt) = rt {
+                                rt.spawn(crate::update::apply(self.state.clone()));
+                            }
+                        }
+                    }
                 });
             });
             ui.add_space(3.0);
@@ -329,6 +364,36 @@ impl App {
                         ui.label(RichText::new("icona estensione = ON/OFF · >10MB passano di qui").color(CHROME).size(11.0));
                     });
                     return;
+                }
+                // controlli globali: pausa/riprendi tutti
+                let any_active = downloads
+                    .iter()
+                    .any(|d| matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting));
+                let any_resumable = downloads
+                    .iter()
+                    .any(|d| matches!(*d.status.lock().unwrap(), Status::Paused | Status::Failed(_)));
+                if any_active || any_resumable {
+                    ui.horizontal(|ui| {
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if any_active && tbtn(ui, "[ ⏸ pausa tutti ]", AMBER) {
+                                for d in downloads {
+                                    if matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting) {
+                                        d.pause.store(true, Ordering::Relaxed);
+                                    }
+                                }
+                            }
+                            if any_resumable && tbtn(ui, "[ ▶ riprendi tutti ]", MINT) {
+                                let rt = self.state.rt.lock().unwrap().clone();
+                                if let Some(rt) = rt {
+                                    for d in downloads {
+                                        if matches!(*d.status.lock().unwrap(), Status::Paused | Status::Failed(_)) {
+                                            rt.spawn(engine::resume(self.state.clone(), d.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                        });
+                    });
                 }
                 egui::ScrollArea::vertical().id_salt("dl_scroll").show(ui, |ui| {
                     for dl in downloads.iter().rev() {
@@ -378,11 +443,19 @@ impl App {
                             RED
                         } else if line.contains("completato") {
                             MINT
+                        } else if line.contains("aggiornamento") {
+                            AMBER
                         } else {
                             MUTED
                         };
                         ui.label(RichText::new(line).color(color).size(12.0));
                     }
+                    // prompt con cursore a blocco lampeggiante
+                    let t = ui.input(|i| i.time);
+                    let cursor = if (t * 2.0) as u64 % 2 == 0 { "█" } else { " " };
+                    ui.label(
+                        RichText::new(format!("mdm> {cursor}")).color(TEXT).size(12.0),
+                    );
                 });
             });
         });
@@ -403,15 +476,17 @@ impl App {
             .outer_margin(egui::Margin::symmetric(0.0, 3.0))
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
+                    let t = ui.input(|i| i.time);
+                    let spin = ["|", "/", "-", "\\"][(t * 8.0) as usize % 4];
                     let (dot, color) = match status {
-                        Status::Active => ("▶", MINT),
-                        Status::Connecting => ("…", AMBER),
+                        Status::Active => (spin, MINT),
+                        Status::Connecting => (spin, AMBER),
                         Status::Paused => ("⏸", AMBER),
                         Status::Done => ("✔", MINT),
                         Status::Failed(_) => ("✗", RED),
                         Status::Cancelled => ("–", MUTED),
                     };
-                    ui.label(RichText::new(dot).color(color));
+                    ui.label(RichText::new(dot).color(color).strong());
                     ui.add(egui::Label::new(RichText::new(&name).color(TEXT).strong()).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         match &status {
@@ -554,6 +629,11 @@ fn sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>, height: f32) {
     let (rect, _) = ui.allocate_exact_size(vec2(ui.available_width(), height), Sense::hover());
     let p = ui.painter();
     p.rect_filled(rect, Rounding::same(3.0), TRACK);
+    // griglia orizzontale da oscilloscopio: 25/50/75%
+    let grid = Color32::from_rgba_unmultiplied(0x8d, 0x94, 0xb8, 26);
+    for frac in [0.25f32, 0.5, 0.75] {
+        p.hline(rect.x_range().shrink(2.0), rect.bottom() - rect.height() * frac, Stroke::new(1.0, grid));
+    }
     if history.is_empty() {
         return;
     }
@@ -578,9 +658,10 @@ fn sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>, height: f32) {
     }
 }
 
-/// Finestra stile terminale: chrome [X][+][_] + titolo colorato + bordo.
+/// Finestra stile terminale: chrome [X][+][_] + titolo colorato + bordo,
+/// con scanline CRT sopra il contenuto.
 fn term_window<R>(ui: &mut egui::Ui, title: &str, accent: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
-    egui::Frame::none()
+    let out = egui::Frame::none()
         .fill(PANEL)
         .stroke(Stroke::new(1.5, PANEL_DARK))
         .rounding(Rounding::same(4.0))
@@ -601,8 +682,17 @@ fn term_window<R>(ui: &mut egui::Ui, title: &str, accent: Color32, add: impl FnO
             ui.painter().hline(ui.max_rect().x_range(), sep_y, Stroke::new(1.0, CHROME));
             ui.add_space(8.0);
             add(ui)
-        })
-        .inner
+        });
+    // scanline CRT: righe scure appena percettibili ogni 3px
+    let rect = out.response.rect;
+    let p = ui.painter();
+    let scan = Color32::from_rgba_unmultiplied(0, 0, 0, 14);
+    let mut y = rect.top() + 1.0;
+    while y < rect.bottom() {
+        p.hline(rect.x_range().shrink(2.0), y, Stroke::new(1.0, scan));
+        y += 3.0;
+    }
+    out.inner
 }
 
 /// Tag/tab del "desktop". Ritorna true se cliccato.

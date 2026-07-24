@@ -129,6 +129,10 @@ pub struct AppState {
     pub log: Mutex<Vec<String>>,
     pub show_window: AtomicBool,
     pub quit: AtomicBool,
+    /// nuova release trovata su GitHub (None = aggiornati)
+    pub update: Mutex<Option<crate::update::UpdateInfo>>,
+    /// download+installazione update in corso
+    pub updating: AtomicBool,
     /// HWND della finestra principale: serve per riaprirla quando egui è
     /// congelato (finestra nascosta = niente WM_PAINT = niente update()).
     pub hwnd: std::sync::atomic::AtomicIsize,

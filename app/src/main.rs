@@ -4,6 +4,7 @@ mod engine;
 mod host;
 mod server;
 mod ui;
+mod update;
 
 use std::sync::Arc;
 
@@ -28,6 +29,7 @@ fn main() {
     }
     engine::scan_resumable(&state);
     server::start(&rt, listener, state.clone());
+    rt.spawn(update::check_loop(state.clone()));
 
     let _ = ui::run(state);
 }
