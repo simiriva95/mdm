@@ -1,0 +1,28 @@
+name: build
+
+on: [push, workflow_dispatch]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: app
+      - run: cargo test --manifest-path app/Cargo.toml
+      - run: cargo build --release --manifest-path app/Cargo.toml
+      - name: package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory dist | Out-Null
+          Copy-Item app\target\release\mdm.exe dist\
+          Copy-Item install\install.ps1 dist\
+          Copy-Item install\install.bat dist\
+          Copy-Item install\com.sriva.downloader.json dist\
+          Copy-Item -Recurse extension dist\extension
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mdm-windows
+          path: dist
