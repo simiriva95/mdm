@@ -13,11 +13,12 @@ Download manager minimale per Windows: intercetta i download grandi da Chrome e 
 
 ## Installazione one-click (Windows)
 
-1. Scarica il pacchetto: GitHub → **Actions** → ultimo run verde → artifact **mdm-windows** (oppure clona e compila, vedi sotto)
-2. Estrai e doppio click su **`install.bat`** (niente admin: installa in `%LOCALAPPDATA%\MDM`)
-3. Una volta sola: `chrome://extensions` → **Developer mode** ON → **Load unpacked** → cartella `extension/`
+1. [**Releases**](../../releases/latest) → scarica **`mdm-setup.exe`** → doppio click. Fine (niente admin: installa in `%LOCALAPPDATA%\MDM`, registra tutto lui).
+2. Una volta sola: `chrome://extensions` → **Developer mode** ON → **Load unpacked** → cartella `%LOCALAPPDATA%\MDM\extension` (il setup te la apre e te lo ricorda).
 
-Fatto. Da ora i download grandi passano da MDM.
+Da ora i download grandi passano da MDM.
+
+Alternativa senza installer: dalla release scarica `mdm-windows.zip` → estrai → doppio click `install.bat`. Nuova release: `git tag v0.x.y && git push origin v0.x.y` — la CI compila, crea l'installer e pubblica la release da sola.
 
 ### Da sorgente
 

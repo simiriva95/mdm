@@ -1,6 +1,13 @@
 name: build
 
-on: [push, workflow_dispatch]
+on:
+  push:
+    branches: ['**']
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
@@ -13,7 +20,8 @@ jobs:
           workspaces: app
       - run: cargo test --manifest-path app/Cargo.toml
       - run: cargo build --release --manifest-path app/Cargo.toml
-      - name: package
+
+      - name: package (artifact per ogni push)
         shell: pwsh
         run: |
           New-Item -ItemType Directory dist | Out-Null
@@ -26,3 +34,23 @@ jobs:
         with:
           name: mdm-windows
           path: dist
+
+      - name: installer (solo tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: pwsh
+        run: |
+          $ver = '${{ github.ref_name }}'.TrimStart('v')
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" /DAppVersion=$ver install\installer.iss
+
+      - name: release (solo tag)
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: pwsh
+        run: |
+          Compress-Archive -Path dist\* -DestinationPath mdm-windows.zip
+          gh release create '${{ github.ref_name }}' `
+            install\out\mdm-setup.exe `
+            mdm-windows.zip `
+            --title 'MDM ${{ github.ref_name }}' `
+            --notes 'Installazione: scarica **mdm-setup.exe**, doppio click, fine. (Prima volta: carica l''estensione come indicato a fine setup.) In alternativa: mdm-windows.zip + install.bat.'
