@@ -61,6 +61,7 @@ pub struct Download {
     pub total: AtomicU64, // 0 = ignoto
     pub done: AtomicU64,
     pub segs: Mutex<Vec<Arc<Seg>>>,
+    pub conc: AtomicU64, // connessioni parallele consentite ora (AIMD)
     pub resumable: AtomicBool, // segmentato con Range: riprende dal punto esatto
     pub status: Mutex<Status>,
     pub cancel: AtomicBool,
@@ -90,6 +91,8 @@ pub struct AppState {
     pub show_window: AtomicBool,
     pub egui_ctx: Mutex<Option<eframe::egui::Context>>,
     pub rt: Mutex<Option<tokio::runtime::Handle>>,
+    /// memoria per host (solo sessione): quante connessioni ha tollerato l'ultima volta
+    pub host_conc: Mutex<std::collections::HashMap<String, u64>>,
     next_id: AtomicU64,
 }
 
@@ -119,6 +122,7 @@ impl AppState {
             total: AtomicU64::new(0),
             done: AtomicU64::new(0),
             segs: Mutex::new(Vec::new()),
+            conc: AtomicU64::new(MAX_SEGMENTS),
             resumable: AtomicBool::new(false),
             status: Mutex::new(Status::Connecting),
             cancel: AtomicBool::new(false),
@@ -163,7 +167,9 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
         *dl.status.lock().unwrap() = Status::Active;
         state.repaint();
         let (client, headers) = build_client(&job);
-        match run_segments(&client, &job.url, &headers, &part, &dl).await {
+        let r = run_segments(&client, &job.url, &headers, &part, &dl, remembered_conc(&state, &job.url)).await;
+        remember_conc(&state, &job.url, &dl);
+        match r {
             Ok(()) => finalize(&dl, &part).await,
             Err(e) => Err(e),
         }
@@ -333,12 +339,20 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
             .into_iter()
             .map(|(start, end)| Arc::new(Seg { start, end, done: AtomicU64::new(0) }))
             .collect();
-        state.log(format!("{} segmenti paralleli, {}", segs.len(), crate::ui::fmt_bytes(len)));
+        // se questo host ha già protestato (429), riparti prudente
+        let start_conc = remembered_conc(state, &job.url);
+        if start_conc < MAX_SEGMENTS {
+            state.log(format!("{} segmenti, parto con {start_conc} connessioni (host già rate-limitato)", segs.len()));
+        } else {
+            state.log(format!("{} segmenti paralleli, {}", segs.len(), crate::ui::fmt_bytes(len)));
+        }
         *dl.segs.lock().unwrap() = segs;
         let f = tokio::fs::File::create(&part).await?;
         f.set_len(len).await?; // pre-alloca
         drop(f);
-        run_segments(&client, &job.url, &headers, &part, dl).await?;
+        let r = run_segments(&client, &job.url, &headers, &part, dl, start_conc).await;
+        remember_conc(state, &job.url, dl);
+        r?;
     } else {
         state.log(if ranges {
             "stream singolo (file piccolo)".to_string()
@@ -423,12 +437,78 @@ fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
     (client, headers)
 }
 
+/// Limita la concorrenza con riduzione AIMD: sui 429 dimezza (8→4→2→1).
+/// (Un semaforo non basta: coi permessi tutti occupati non c'è nulla da togliere.)
+struct Gate {
+    max: AtomicU64,
+    active: AtomicU64,
+    notify: tokio::sync::Notify,
+}
+
+impl Gate {
+    fn new(max: u64) -> Self {
+        Self { max: AtomicU64::new(max.max(1)), active: AtomicU64::new(0), notify: tokio::sync::Notify::new() }
+    }
+
+    async fn enter(&self) {
+        loop {
+            let got = self
+                .active
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |a| {
+                    if a < self.max.load(Ordering::SeqCst) { Some(a + 1) } else { None }
+                })
+                .is_ok();
+            if got {
+                return;
+            }
+            // timeout di sicurezza contro la race notify/leave
+            let _ = tokio::time::timeout(std::time::Duration::from_millis(250), self.notify.notified()).await;
+        }
+    }
+
+    fn leave(&self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    fn shrink(&self) -> u64 {
+        let mut new = 1;
+        let _ = self.max.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |m| {
+            new = (m / 2).max(1);
+            Some(new)
+        });
+        new
+    }
+}
+
+enum SegErr {
+    RateLimited(Option<u64>), // Retry-After in secondi, se il server lo dice
+    Other(anyhow::Error),
+}
+
+impl<E: Into<anyhow::Error>> From<E> for SegErr {
+    fn from(e: E) -> Self {
+        SegErr::Other(e.into())
+    }
+}
+
+/// Sonnellino interrompibile: esce subito su pausa/cancel.
+async fn nap(dl: &Download, secs: u64) {
+    for _ in 0..secs * 2 {
+        if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
 async fn run_segments(
     client: &reqwest::Client,
     url: &str,
     headers: &HeaderMap,
     part: &Path,
     dl: &Arc<Download>,
+    start_conc: u64,
 ) -> anyhow::Result<()> {
     let total = dl.total.load(Ordering::Relaxed);
     // resume: assicura che il .part abbia la dimensione giusta
@@ -439,9 +519,8 @@ async fn run_segments(
     let _ = write_sidecar(dl, part);
 
     let segs = dl.segs.lock().unwrap().clone();
-    // se il server risponde 429 (troppe connessioni) riduciamo la concorrenza:
-    // ogni 429 "brucia" un permesso, da 8 connessioni si può scendere fino a 1
-    let sem = Arc::new(tokio::sync::Semaphore::new(MAX_SEGMENTS as usize));
+    let gate = Arc::new(Gate::new(start_conc));
+    dl.conc.store(start_conc.max(1), Ordering::Relaxed);
     let mut tasks = Vec::new();
     for seg in segs {
         if seg.done.load(Ordering::Relaxed) >= seg.len() {
@@ -452,30 +531,38 @@ async fn run_segments(
         let headers = headers.clone();
         let path = part.to_path_buf();
         let dl = dl.clone();
-        let sem = sem.clone();
+        let gate = gate.clone();
         tasks.push(tokio::spawn(async move {
-            let _permit = sem.clone().acquire_owned().await;
-            let mut last_err = anyhow::anyhow!("segmento non avviato");
-            for attempt in 0..SEGMENT_RETRIES {
+            let mut attempts = 0u32;
+            let mut rl_hits = 0u32;
+            loop {
                 if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
                     bail!("interrotto");
                 }
-                match fetch_segment(&client, &url, &headers, &path, &seg, &dl).await {
+                gate.enter().await;
+                let res = fetch_segment(&client, &url, &headers, &path, &seg, &dl).await;
+                gate.leave();
+                match res {
                     Ok(()) => return Ok(()),
-                    Err(e) => {
-                        let rate_limited = format!("{e:#}").contains("429");
-                        if rate_limited {
-                            if let Ok(extra) = sem.clone().try_acquire_owned() {
-                                extra.forget(); // una connessione in meno, per sempre
-                            }
+                    Err(SegErr::RateLimited(retry_after)) => {
+                        rl_hits += 1;
+                        if rl_hits > 8 {
+                            bail!("il server continua a rispondere 429 anche a 1 connessione");
                         }
-                        let ms = if rate_limited { 2500 * (attempt as u64 + 1) } else { 800 * (attempt as u64 + 1) };
-                        tokio::time::sleep(std::time::Duration::from_millis(ms)).await;
-                        last_err = e;
+                        let new_max = gate.shrink();
+                        dl.conc.store(new_max, Ordering::Relaxed);
+                        let wait = retry_after.unwrap_or(2 + 3 * rl_hits as u64).min(30);
+                        nap(&dl, wait).await;
+                    }
+                    Err(SegErr::Other(e)) => {
+                        attempts += 1;
+                        if attempts >= SEGMENT_RETRIES {
+                            return Err(e);
+                        }
+                        nap(&dl, attempts as u64).await;
                     }
                 }
             }
-            Err(last_err)
         }));
     }
 
@@ -514,7 +601,7 @@ async fn fetch_segment(
     path: &Path,
     seg: &Seg,
     dl: &Download,
-) -> anyhow::Result<()> {
+) -> Result<(), SegErr> {
     let start = seg.start + seg.done.load(Ordering::Relaxed);
     if start > seg.end {
         return Ok(());
@@ -525,8 +612,16 @@ async fn fetch_segment(
         .header(RANGE, format!("bytes={start}-{}", seg.end))
         .send()
         .await?;
+    if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let retry_after = resp
+            .headers()
+            .get(reqwest::header::RETRY_AFTER)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse().ok());
+        return Err(SegErr::RateLimited(retry_after));
+    }
     if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
-        bail!("range rifiutato dal server (status {})", resp.status());
+        return Err(SegErr::Other(anyhow::anyhow!("range rifiutato dal server (status {})", resp.status())));
     }
 
     let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
@@ -535,7 +630,7 @@ async fn fetch_segment(
     while let Some(chunk) = stream.next().await {
         if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
             file.flush().await?;
-            bail!("interrotto");
+            return Err(SegErr::Other(anyhow::anyhow!("interrotto")));
         }
         let chunk = chunk?;
         file.write_all(&chunk).await?;
@@ -597,6 +692,21 @@ fn write_sidecar(dl: &Download, part: &Path) -> anyhow::Result<()> {
     };
     std::fs::write(sidecar_path(part), serde_json::to_vec(&sc)?)?;
     Ok(())
+}
+
+fn host_of(url: &str) -> String {
+    url.split("://").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("").to_string()
+}
+
+fn remembered_conc(state: &AppState, url: &str) -> u64 {
+    state.host_conc.lock().unwrap().get(&host_of(url)).copied().unwrap_or(MAX_SEGMENTS)
+}
+
+fn remember_conc(state: &AppState, url: &str, dl: &Download) {
+    let conc = dl.conc.load(Ordering::Relaxed);
+    if conc < MAX_SEGMENTS {
+        state.host_conc.lock().unwrap().insert(host_of(url), conc);
+    }
 }
 
 fn sidecar_path(part: &Path) -> PathBuf {
@@ -737,6 +847,28 @@ mod tests {
         assert_eq!(filename_from_disposition(r#"attachment; filename="a b.zip""#), Some("a b.zip".into()));
         assert_eq!(filename_from_disposition("attachment; filename*=UTF-8''a%20b.zip"), Some("a b.zip".into()));
         assert_eq!(filename_from_disposition("inline"), None);
+    }
+
+    #[test]
+    fn hosts() {
+        assert_eq!(host_of("https://a.b.c/x/y?z=1"), "a.b.c");
+        assert_eq!(host_of("http://h:8080/f.zip"), "h:8080");
+    }
+
+    #[tokio::test]
+    async fn gate_aimd() {
+        let g = Gate::new(8);
+        assert_eq!(g.shrink(), 4);
+        assert_eq!(g.shrink(), 2);
+        assert_eq!(g.shrink(), 1);
+        assert_eq!(g.shrink(), 1); // mai sotto 1
+        g.enter().await; // occupa l'unico slot
+        let blocked = tokio::time::timeout(std::time::Duration::from_millis(60), g.enter()).await.is_err();
+        assert!(blocked, "con max=1 il secondo enter deve bloccare");
+        g.leave();
+        tokio::time::timeout(std::time::Duration::from_millis(500), g.enter())
+            .await
+            .expect("dopo leave() lo slot si libera");
     }
 
     #[test]

@@ -392,7 +392,7 @@ impl App {
                 let info = match &status {
                     Status::Connecting => "connessione...".to_string(),
                     Status::Active => {
-                        let conns = dl.segs.lock().unwrap().len();
+                        let conns = dl.conc.load(Ordering::Relaxed);
                         let eta = if speed > 1.0 && total > done {
                             fmt_eta((total - done) as f64 / speed)
                         } else {
