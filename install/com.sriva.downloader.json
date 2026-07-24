@@ -1,0 +1,7 @@
+{
+  "name": "com.sriva.downloader",
+  "description": "Mini Download Manager native host",
+  "path": "EXE_PATH",
+  "type": "stdio",
+  "allowed_origins": ["chrome-extension://gmffaagflamiefieafmcoipcnmajgmdh/"]
+}
