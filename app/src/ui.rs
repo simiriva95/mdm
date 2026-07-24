@@ -326,6 +326,7 @@ impl App {
         let total = dl.total.load(Ordering::Relaxed);
         let status = dl.status.lock().unwrap().clone();
         let name = dl.name.lock().unwrap().clone();
+        let url = dl.job.lock().unwrap().url.clone();
         let speed = self.speed_of(dl.id, done);
 
         egui::Frame::none()
@@ -382,6 +383,22 @@ impl App {
                             }
                         }
                     });
+                });
+
+                // link sorgente: click = copia negli appunti
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("↗").color(CHROME).size(10.0));
+                    let resp = ui
+                        .add(
+                            egui::Label::new(RichText::new(&url).color(BLUE).size(10.0))
+                                .truncate()
+                                .sense(Sense::click()),
+                        )
+                        .on_hover_text("click: copia il link");
+                    if resp.clicked() {
+                        ui.ctx().copy_text(url.clone());
+                        self.state.log(format!("link copiato: {url}"));
+                    }
                 });
 
                 ui.add_space(2.0);

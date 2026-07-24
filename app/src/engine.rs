@@ -13,8 +13,16 @@ use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
 const MAX_SEGMENTS: u64 = 8;
 const MIN_SEGMENT: u64 = 4 * 1024 * 1024;
-const SEGMENT_RETRIES: u32 = 5;
+const SEGMENT_RETRIES: u32 = 8; // consecutivi senza alcun progresso
 const SIDECAR_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
+// stallo: se il server non manda byte per questo tempo la connessione viene rifatta
+const STALL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// tempo massimo per ottenere gli header di risposta
+const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+// work stealing: si dimezza un segmento solo se restano almeno 2*STEAL_MIN byte
+const STEAL_MIN: u64 = 2 * 1024 * 1024;
+// AIMD in salita: dopo questo periodo senza 429 si prova ad aggiungere 1 connessione
+const RAMP_QUIET: std::time::Duration = std::time::Duration::from_secs(45);
 // dopo un crash gli ultimi write potrebbero non essere arrivati su disco
 // (buffer interno di tokio::fs::File): al ripristino arretriamo ogni segmento
 const CRASH_REWIND: u64 = 2 * 1024 * 1024;
@@ -44,14 +52,45 @@ pub enum Status {
 
 pub struct Seg {
     pub start: u64,
-    pub end: u64,
+    // end mobile: il work stealing può restringerlo mentre il segmento scarica
+    pub end: AtomicU64,
     pub done: AtomicU64,
 }
 
 impl Seg {
-    pub fn len(&self) -> u64 {
-        self.end.saturating_sub(self.start) + 1
+    fn new(start: u64, end: u64, done: u64) -> Arc<Self> {
+        Arc::new(Self { start, end: AtomicU64::new(end), done: AtomicU64::new(done) })
     }
+
+    pub fn end(&self) -> u64 {
+        self.end.load(Ordering::Relaxed)
+    }
+
+    pub fn len(&self) -> u64 {
+        self.end().saturating_sub(self.start) + 1
+    }
+
+    fn remaining(&self) -> u64 {
+        self.len().saturating_sub(self.done.load(Ordering::Relaxed))
+    }
+}
+
+/// Work stealing: prende il segmento col più lavoro residuo, lo dimezza e
+/// ritorna la metà alta come nuovo segmento. None se non c'è nulla da rubare.
+fn steal_segment(segs: &mut Vec<Arc<Seg>>) -> Option<Arc<Seg>> {
+    let victim = segs
+        .iter()
+        .filter(|s| s.remaining() >= STEAL_MIN * 2)
+        .max_by_key(|s| s.remaining())?
+        .clone();
+    let end = victim.end();
+    let steal = victim.remaining() / 2;
+    let new_end = end - steal;
+    // prima si restringe la vittima, poi nasce il ladro: mai due proprietari
+    victim.end.store(new_end, Ordering::Relaxed);
+    let thief = Seg::new(new_end + 1, end, 0);
+    segs.push(thief.clone());
+    Some(thief)
 }
 
 pub struct Download {
@@ -203,7 +242,7 @@ fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>)
             // file e sidecar restano: [resume] ritenta da dove era arrivato
             *status = Status::Failed(format!("{e:#}"));
             let _ = write_sidecar(dl, &part);
-            state.log(format!("ERRORE: {e:#}"));
+            state.log(format!("ERRORE: {e:#} — url: {}", dl.job.lock().unwrap().url));
         }
     }
     drop(status);
@@ -248,7 +287,7 @@ pub fn scan_resumable(state: &Arc<AppState>) {
             .iter()
             .map(|s| {
                 let safe_done = if sc.resumable { s.done.saturating_sub(CRASH_REWIND) } else { 0 };
-                Arc::new(Seg { start: s.start, end: s.end, done: AtomicU64::new(safe_done) })
+                Seg::new(s.start, s.end, safe_done)
             })
             .collect();
         dl.done.store(segs.iter().map(|s| s.done.load(Ordering::Relaxed)).sum(), Ordering::Relaxed);
@@ -264,25 +303,25 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
 
     // probe: GET con Range 0-0. 206 => range supportati + totale da Content-Range;
     // 200 => niente range, ma la risposta è il file intero e la riusiamo come stream.
-    let mut probe = client
-        .get(&job.url)
-        .headers(headers.clone())
-        .header(RANGE, "bytes=0-0")
-        .send()
-        .await
-        .context("connessione fallita")?;
+    let mut probe = tokio::time::timeout(
+        SEND_TIMEOUT,
+        client.get(&job.url).headers(headers.clone()).header(RANGE, "bytes=0-0").send(),
+    )
+    .await
+    .context("il server non risponde (timeout)")?
+    .context("connessione fallita")?;
     for attempt in 1..=2u64 {
         if probe.status().as_u16() != 429 {
             break;
         }
         tokio::time::sleep(std::time::Duration::from_millis(2500 * attempt)).await;
-        probe = client
-            .get(&job.url)
-            .headers(headers.clone())
-            .header(RANGE, "bytes=0-0")
-            .send()
-            .await
-            .context("connessione fallita")?;
+        probe = tokio::time::timeout(
+            SEND_TIMEOUT,
+            client.get(&job.url).headers(headers.clone()).header(RANGE, "bytes=0-0").send(),
+        )
+        .await
+        .context("il server non risponde (timeout)")?
+        .context("connessione fallita")?;
     }
     anyhow::ensure!(probe.status().is_success(), "status {}", probe.status());
 
@@ -337,7 +376,7 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
         drop(probe);
         let segs: Vec<Arc<Seg>> = split_segments(len, MAX_SEGMENTS, MIN_SEGMENT)
             .into_iter()
-            .map(|(start, end)| Arc::new(Seg { start, end, done: AtomicU64::new(0) }))
+            .map(|(start, end)| Seg::new(start, end, 0))
             .collect();
         // se questo host ha già protestato (429), riparti prudente
         let start_conc = remembered_conc(state, &job.url);
@@ -359,11 +398,7 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
         } else {
             "stream singolo (il server non supporta Range)".to_string()
         });
-        *dl.segs.lock().unwrap() = vec![Arc::new(Seg {
-            start: 0,
-            end: len.unwrap_or(1).saturating_sub(1),
-            done: AtomicU64::new(0),
-        })];
+        *dl.segs.lock().unwrap() = vec![Seg::new(0, len.unwrap_or(1).saturating_sub(1), 0)];
         let _ = write_sidecar(dl, &part);
         // se il probe era un 200 pieno riusiamo quella risposta, altrimenti nuova GET
         let reuse = if ranges { None } else { Some(probe) };
@@ -416,7 +451,11 @@ pub fn system_proxy() -> Option<String> {
 
 fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
     let ua = if job.user_agent.is_empty() { "mdm/0.2".to_string() } else { job.user_agent.clone() };
-    let mut builder = reqwest::Client::builder().user_agent(ua);
+    let mut builder = reqwest::Client::builder()
+        .user_agent(ua)
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        .pool_max_idle_per_host(MAX_SEGMENTS as usize);
     if let Some(p) = system_proxy() {
         if let Ok(proxy) = reqwest::Proxy::all(&p) {
             builder = builder.proxy(proxy);
@@ -437,17 +476,24 @@ fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
     (client, headers)
 }
 
-/// Limita la concorrenza con riduzione AIMD: sui 429 dimezza (8→4→2→1).
+/// Limita la concorrenza con AIMD vero: sui 429 dimezza (8→4→2→1),
+/// dopo RAMP_QUIET senza 429 risale di 1 fino a MAX_SEGMENTS.
 /// (Un semaforo non basta: coi permessi tutti occupati non c'è nulla da togliere.)
 struct Gate {
     max: AtomicU64,
     active: AtomicU64,
     notify: tokio::sync::Notify,
+    last_shrink: Mutex<std::time::Instant>,
 }
 
 impl Gate {
     fn new(max: u64) -> Self {
-        Self { max: AtomicU64::new(max.max(1)), active: AtomicU64::new(0), notify: tokio::sync::Notify::new() }
+        Self {
+            max: AtomicU64::new(max.max(1)),
+            active: AtomicU64::new(0),
+            notify: tokio::sync::Notify::new(),
+            last_shrink: Mutex::new(std::time::Instant::now()),
+        }
     }
 
     async fn enter(&self) {
@@ -477,7 +523,24 @@ impl Gate {
             new = (m / 2).max(1);
             Some(new)
         });
+        *self.last_shrink.lock().unwrap() = std::time::Instant::now();
         new
+    }
+
+    /// Additive increase: +1 connessione se non ci sono 429 da `quiet`.
+    fn maybe_grow(&self, quiet: std::time::Duration) -> Option<u64> {
+        if self.last_shrink.lock().unwrap().elapsed() < quiet {
+            return None;
+        }
+        let m = self.max.load(Ordering::SeqCst);
+        if m >= MAX_SEGMENTS {
+            return None;
+        }
+        self.max.store(m + 1, Ordering::SeqCst);
+        // il grow conta come "evento": la prossima salita aspetta un altro periodo quiet
+        *self.last_shrink.lock().unwrap() = std::time::Instant::now();
+        self.notify.notify_waiters();
+        Some(m + 1)
     }
 }
 
@@ -518,50 +581,37 @@ async fn run_segments(
     }
     let _ = write_sidecar(dl, part);
 
-    let segs = dl.segs.lock().unwrap().clone();
     let gate = Arc::new(Gate::new(start_conc));
     dl.conc.store(start_conc.max(1), Ordering::Relaxed);
+
+    // coda dei segmenti da fare; quando è vuota i worker rubano lavoro
+    // dimezzando il segmento più indietro (stile FDM: nessuna connessione ferma)
+    let queue: Arc<Mutex<std::collections::VecDeque<Arc<Seg>>>> = Arc::new(Mutex::new(
+        dl.segs.lock().unwrap().iter().filter(|s| s.remaining() > 0).cloned().collect(),
+    ));
+
     let mut tasks = Vec::new();
-    for seg in segs {
-        if seg.done.load(Ordering::Relaxed) >= seg.len() {
-            continue;
-        }
+    for _ in 0..MAX_SEGMENTS {
         let client = client.clone();
         let url = url.to_string();
         let headers = headers.clone();
         let path = part.to_path_buf();
         let dl = dl.clone();
         let gate = gate.clone();
+        let queue = queue.clone();
         tasks.push(tokio::spawn(async move {
-            let mut attempts = 0u32;
-            let mut rl_hits = 0u32;
             loop {
-                if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
-                    bail!("interrotto");
-                }
-                gate.enter().await;
-                let res = fetch_segment(&client, &url, &headers, &path, &seg, &dl).await;
-                gate.leave();
-                match res {
-                    Ok(()) => return Ok(()),
-                    Err(SegErr::RateLimited(retry_after)) => {
-                        rl_hits += 1;
-                        if rl_hits > 8 {
-                            bail!("il server continua a rispondere 429 anche a 1 connessione");
-                        }
-                        let new_max = gate.shrink();
-                        dl.conc.store(new_max, Ordering::Relaxed);
-                        let wait = retry_after.unwrap_or(2 + 3 * rl_hits as u64).min(30);
-                        nap(&dl, wait).await;
+                let seg = {
+                    let popped = queue.lock().unwrap().pop_front();
+                    match popped {
+                        Some(s) => s,
+                        None => match steal_segment(&mut dl.segs.lock().unwrap()) {
+                            Some(s) => s,
+                            None => return Ok(()), // niente più lavoro
+                        },
                     }
-                    Err(SegErr::Other(e)) => {
-                        attempts += 1;
-                        if attempts >= SEGMENT_RETRIES {
-                            return Err(e);
-                        }
-                        nap(&dl, attempts as u64).await;
-                    }
-                }
+                };
+                work_segment(&client, &url, &headers, &path, &seg, &dl, &gate).await?;
             }
         }));
     }
@@ -578,6 +628,20 @@ async fn run_segments(
         })
     };
 
+    // AIMD in salita: periodicamente riprova ad alzare la concorrenza
+    let ramp = {
+        let dl = dl.clone();
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                if let Some(new_max) = gate.maybe_grow(RAMP_QUIET) {
+                    dl.conc.store(new_max, Ordering::Relaxed);
+                }
+            }
+        })
+    };
+
     let mut first_err = None;
     for t in tasks {
         match t.await {
@@ -587,10 +651,60 @@ async fn run_segments(
         }
     }
     saver.abort();
+    ramp.abort();
     let _ = write_sidecar(dl, part);
     match first_err {
         None => Ok(()),
         Some(e) => Err(e),
+    }
+}
+
+/// Porta a termine un segmento con retry: i contatori di errore si azzerano
+/// quando arrivano byte, quindi un download che avanza non muore mai da solo.
+async fn work_segment(
+    client: &reqwest::Client,
+    url: &str,
+    headers: &HeaderMap,
+    path: &Path,
+    seg: &Arc<Seg>,
+    dl: &Arc<Download>,
+    gate: &Gate,
+) -> anyhow::Result<()> {
+    let mut attempts = 0u32;
+    let mut rl_hits = 0u32;
+    loop {
+        if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
+            bail!("interrotto");
+        }
+        let before = seg.done.load(Ordering::Relaxed);
+        gate.enter().await;
+        let res = fetch_segment(client, url, headers, path, seg, dl).await;
+        gate.leave();
+        if seg.done.load(Ordering::Relaxed) > before {
+            // progresso reale: riparte il conto degli errori consecutivi
+            attempts = 0;
+            rl_hits = 0;
+        }
+        match res {
+            Ok(()) => return Ok(()),
+            Err(SegErr::RateLimited(retry_after)) => {
+                rl_hits += 1;
+                if rl_hits > 12 {
+                    bail!("il server continua a rispondere 429 anche a 1 connessione");
+                }
+                let new_max = gate.shrink();
+                dl.conc.store(new_max, Ordering::Relaxed);
+                let wait = retry_after.unwrap_or(2 + 3 * rl_hits as u64).min(30);
+                nap(dl, wait).await;
+            }
+            Err(SegErr::Other(e)) => {
+                attempts += 1;
+                if attempts >= SEGMENT_RETRIES {
+                    return Err(e);
+                }
+                nap(dl, attempts as u64).await;
+            }
+        }
     }
 }
 
@@ -603,15 +717,15 @@ async fn fetch_segment(
     dl: &Download,
 ) -> Result<(), SegErr> {
     let start = seg.start + seg.done.load(Ordering::Relaxed);
-    if start > seg.end {
+    if start > seg.end() {
         return Ok(());
     }
-    let resp = client
-        .get(url)
-        .headers(headers.clone())
-        .header(RANGE, format!("bytes={start}-{}", seg.end))
-        .send()
-        .await?;
+    let resp = tokio::time::timeout(
+        SEND_TIMEOUT,
+        client.get(url).headers(headers.clone()).header(RANGE, format!("bytes={start}-{}", seg.end())).send(),
+    )
+    .await
+    .map_err(|_| SegErr::Other(anyhow::anyhow!("il server non risponde (timeout {}s)", SEND_TIMEOUT.as_secs())))??;
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let retry_after = resp
             .headers()
@@ -626,18 +740,45 @@ async fn fetch_segment(
 
     let mut file = tokio::fs::OpenOptions::new().write(true).open(path).await?;
     file.seek(std::io::SeekFrom::Start(start)).await?;
+    let mut pos = start;
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
         if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
             file.flush().await?;
             return Err(SegErr::Other(anyhow::anyhow!("interrotto")));
         }
-        let chunk = chunk?;
-        file.write_all(&chunk).await?;
-        seg.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
-        dl.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
+        // watchdog anti-stallo: connessione morta = errore = riconnessione
+        let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+            Err(_) => {
+                file.flush().await?;
+                return Err(SegErr::Other(anyhow::anyhow!(
+                    "stallo: nessun dato per {}s, riconnetto",
+                    STALL_TIMEOUT.as_secs()
+                )));
+            }
+            Ok(None) => break,
+            Ok(Some(c)) => c?,
+        };
+        // il work stealing può aver ristretto end: scrivi solo la parte nostra
+        let end = seg.end();
+        if pos > end {
+            break;
+        }
+        let take = chunk.len().min((end - pos + 1) as usize);
+        file.write_all(&chunk[..take]).await?;
+        pos += take as u64;
+        seg.done.fetch_add(take as u64, Ordering::Relaxed);
+        dl.done.fetch_add(take as u64, Ordering::Relaxed);
+        if take < chunk.len() {
+            break; // fine del segmento (ristretto): il resto è del ladro
+        }
     }
     file.flush().await?;
+    // il server può chiudere lo stream a metà: prima veniva ignorato e il file
+    // finiva con un buco. Ora è un errore e il retry riparte dal byte esatto.
+    if seg.start + seg.done.load(Ordering::Relaxed) <= seg.end() {
+        return Err(SegErr::Other(anyhow::anyhow!("connessione chiusa a metà segmento, riprendo")));
+    }
     Ok(())
 }
 
@@ -651,7 +792,9 @@ async fn single_stream(
 ) -> anyhow::Result<()> {
     let resp = match reuse {
         Some(r) => r,
-        None => client.get(url).headers(headers.clone()).send().await?,
+        None => tokio::time::timeout(SEND_TIMEOUT, client.get(url).headers(headers.clone()).send())
+            .await
+            .map_err(|_| anyhow::anyhow!("il server non risponde (timeout {}s)", SEND_TIMEOUT.as_secs()))??,
     };
     anyhow::ensure!(resp.status().is_success(), "status {}", resp.status());
     if let Some(len) = resp.content_length().filter(|l| *l > 0) {
@@ -660,20 +803,33 @@ async fn single_stream(
 
     let seg = dl.segs.lock().unwrap().first().cloned();
     let mut file = tokio::fs::File::create(part).await?;
+    let mut written = 0u64;
     let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
+    loop {
         if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
             file.flush().await?;
             bail!("interrotto");
         }
-        let chunk = chunk?;
+        let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
+            Err(_) => {
+                file.flush().await?;
+                bail!("stallo: nessun dato per {}s", STALL_TIMEOUT.as_secs());
+            }
+            Ok(None) => break,
+            Ok(Some(c)) => c?,
+        };
         file.write_all(&chunk).await?;
+        written += chunk.len() as u64;
         dl.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         if let Some(seg) = &seg {
             seg.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);
         }
     }
     file.flush().await?;
+    let total = dl.total.load(Ordering::Relaxed);
+    if total > 0 && written < total {
+        bail!("connessione chiusa in anticipo ({} su {})", crate::ui::fmt_bytes(written), crate::ui::fmt_bytes(total));
+    }
     Ok(())
 }
 
@@ -687,7 +843,7 @@ fn write_sidecar(dl: &Download, part: &Path) -> anyhow::Result<()> {
             .lock()
             .unwrap()
             .iter()
-            .map(|s| SegSave { start: s.start, end: s.end, done: s.done.load(Ordering::Relaxed) })
+            .map(|s| SegSave { start: s.start, end: s.end(), done: s.done.load(Ordering::Relaxed).min(s.len()) })
             .collect(),
     };
     std::fs::write(sidecar_path(part), serde_json::to_vec(&sc)?)?;
@@ -869,6 +1025,42 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_millis(500), g.enter())
             .await
             .expect("dopo leave() lo slot si libera");
+    }
+
+    #[test]
+    fn gate_grow() {
+        let g = Gate::new(8);
+        assert_eq!(g.shrink(), 4);
+        // quiet non ancora passato: niente salita
+        assert_eq!(g.maybe_grow(std::time::Duration::from_secs(3600)), None);
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(5));
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(6));
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(7));
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(8));
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), None); // mai sopra MAX_SEGMENTS
+    }
+
+    #[test]
+    fn steal_splits_biggest() {
+        let mb = 1024 * 1024;
+        let a = Seg::new(0, 100 * mb - 1, 10 * mb); // 90 MB residui
+        let b = Seg::new(100 * mb, 110 * mb - 1, 0); // 10 MB residui
+        let mut segs = vec![a.clone(), b];
+        let t = steal_segment(&mut segs).expect("c'è da rubare");
+        // il ladro prende la metà alta di a, copertura contigua senza buchi
+        assert_eq!(t.end(), 100 * mb - 1);
+        assert_eq!(a.end() + 1, t.start);
+        assert!(t.len() >= STEAL_MIN);
+        assert!(a.remaining() >= STEAL_MIN);
+        assert_eq!(segs.len(), 3);
+    }
+
+    #[test]
+    fn steal_leaves_small_segments_alone() {
+        let a = Seg::new(0, STEAL_MIN * 2 - 2, 0); // residuo sotto soglia
+        let mut segs = vec![a];
+        assert!(steal_segment(&mut segs).is_none());
+        assert_eq!(segs.len(), 1);
     }
 
     #[test]
