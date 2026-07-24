@@ -60,10 +60,15 @@ fn connect_or_spawn() -> anyhow::Result<TcpStream> {
     #[cfg(windows)]
     let spawned = {
         use std::os::windows::process::CommandExt;
-        // Chrome mette l'host in un job object che ucciderebbe i figli:
+        // Chrome mette l'host in un job object (che ucciderebbe i figli) e può
+        // lanciarlo a priorità bassa: ereditata, Windows strozza rete e disco.
         // CREATE_BREAKAWAY_FROM_JOB (0x0100_0000) + DETACHED_PROCESS (0x8)
-        cmd.creation_flags(0x0100_0008).spawn().or_else(|_| Command::new(&exe)
-            .stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null()).spawn())
+        // + NORMAL_PRIORITY_CLASS (0x20)
+        cmd.creation_flags(0x0100_0028).spawn().or_else(|_| {
+            let mut cmd = Command::new(&exe);
+            cmd.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+            cmd.creation_flags(0x28).spawn() // breakaway vietato dal job: almeno la priorità
+        })
     };
     #[cfg(not(windows))]
     let spawned = cmd.spawn();

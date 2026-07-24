@@ -23,6 +23,9 @@ fn main() {
     let state = Arc::new(engine::AppState::default());
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     *state.rt.lock().unwrap() = Some(rt.handle().clone());
+    if let Some(p) = engine::system_proxy() {
+        state.log(format!("proxy di sistema: {p}"));
+    }
     engine::scan_resumable(&state);
     server::start(&rt, listener, state.clone());
 

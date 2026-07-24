@@ -16,6 +16,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-uti
 
 [target.'cfg(windows)'.dependencies]
 tray-icon = "0.19"
+winreg = "0.52"
 
 [profile.release]
 lto = true

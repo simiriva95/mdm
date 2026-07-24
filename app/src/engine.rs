@@ -348,9 +348,50 @@ async fn finalize(dl: &Download, part: &Path) -> anyhow::Result<PathBuf> {
     Ok(path)
 }
 
+/// Proxy di sistema Windows (WinINET): Chrome lo usa, quindi anche noi —
+/// su reti aziendali il traffico diretto viene spesso strozzato o bloccato.
+#[cfg(windows)]
+pub fn system_proxy() -> Option<String> {
+    use winreg::enums::HKEY_CURRENT_USER;
+    use winreg::RegKey;
+    let key = RegKey::predef(HKEY_CURRENT_USER)
+        .open_subkey("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+        .ok()?;
+    let enabled: u32 = key.get_value("ProxyEnable").ok()?;
+    if enabled == 0 {
+        return None;
+    }
+    let server: String = key.get_value("ProxyServer").ok()?;
+    if server.is_empty() {
+        return None;
+    }
+    // formato "host:port" oppure "http=h:p;https=h:p;ftp=..."
+    let pick = if server.contains('=') {
+        server
+            .split(';')
+            .find_map(|p| p.strip_prefix("https="))
+            .or_else(|| server.split(';').find_map(|p| p.strip_prefix("http=")))?
+            .to_string()
+    } else {
+        server
+    };
+    Some(if pick.contains("://") { pick } else { format!("http://{pick}") })
+}
+
+#[cfg(not(windows))]
+pub fn system_proxy() -> Option<String> {
+    None
+}
+
 fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
     let ua = if job.user_agent.is_empty() { "mdm/0.2".to_string() } else { job.user_agent.clone() };
-    let client = reqwest::Client::builder().user_agent(ua).build().expect("client http");
+    let mut builder = reqwest::Client::builder().user_agent(ua);
+    if let Some(p) = system_proxy() {
+        if let Ok(proxy) = reqwest::Proxy::all(&p) {
+            builder = builder.proxy(proxy);
+        }
+    }
+    let client = builder.build().expect("client http");
     let mut headers = HeaderMap::new();
     if !job.cookies.is_empty() {
         if let Ok(v) = HeaderValue::from_str(&job.cookies) {
