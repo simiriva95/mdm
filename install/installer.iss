@@ -30,6 +30,10 @@ italian.FinishedLabel=MDM è installato.%nUltimo passo (una volta sola): in Chro
 Source: "..\app\target\release\mdm.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\extension\*"; DestDir: "{app}\extension"; Flags: recursesubdirs ignoreversion
 
+[Icons]
+Name: "{autoprograms}\MDM"; Filename: "{app}\mdm.exe"
+Name: "{autodesktop}\MDM"; Filename: "{app}\mdm.exe"
+
 [Registry]
 Root: HKCU; Subkey: "Software\Google\Chrome\NativeMessagingHosts\com.sriva.downloader"; ValueType: string; ValueData: "{app}\com.sriva.downloader.json"; Flags: uninsdeletekey
 
