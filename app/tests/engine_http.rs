@@ -444,6 +444,8 @@ async fn dead_link_fails_once_without_retrying() {
     assert_eq!(dl.retries.load(Ordering::Relaxed), 0, "un 404 non va ritentato");
     assert!(start.elapsed() < std::time::Duration::from_secs(3), "ha aspettato un backoff inutile");
     assert!(bh.hits.load(Ordering::SeqCst) <= 3, "troppe richieste per un link morto");
+    // fallendo prima di avere un nome non deve sporcare la cartella di lavoro
+    assert!(!std::path::Path::new(".part.mdm.json").exists(), "sidecar orfano nella cwd");
 }
 
 async fn wait_for_progress(state: &Arc<AppState>, bytes: u64) -> Arc<engine::Download> {

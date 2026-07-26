@@ -462,7 +462,11 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
 }
 
 fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>) {
-    let part = part_path(&dl.path.lock().unwrap());
+    let target = dl.path.lock().unwrap().clone();
+    // fallito prima di scegliere un nome (404 sul probe): non c'è nessun .part
+    // da salvare, e scriverlo creerebbe un ".part.mdm.json" nella cwd
+    let has_file = !target.as_os_str().is_empty();
+    let part = part_path(&target);
     let ok = result.is_ok();
     let mut status = dl.status.lock().unwrap();
     match result {
@@ -472,13 +476,17 @@ fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>)
         }
         Err(_) if dl.pause.load(Ordering::Relaxed) => {
             *status = Status::Paused;
-            let _ = write_sidecar(dl, &part);
+            if has_file {
+                let _ = write_sidecar(dl, &part);
+            }
             state.log(format!("in pausa: {}", dl.name.lock().unwrap()));
         }
         Err(_) if dl.cancel.load(Ordering::Relaxed) => {
             *status = Status::Cancelled;
-            let _ = std::fs::remove_file(&part);
-            let _ = std::fs::remove_file(sidecar_path(&part));
+            if has_file {
+                let _ = std::fs::remove_file(&part);
+                let _ = std::fs::remove_file(sidecar_path(&part));
+            }
             state.log(format!("annullato: {}", dl.name.lock().unwrap()));
         }
         Err(e) => {
@@ -491,7 +499,9 @@ fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>)
             };
             // file e sidecar restano: [resume] ritenta da dove era arrivato
             *status = Status::Failed(msg.clone());
-            let _ = write_sidecar(dl, &part);
+            if has_file {
+                let _ = write_sidecar(dl, &part);
+            }
             state.log(format!("ERRORE: {msg} — url: {}", dl.job.lock().unwrap().url));
         }
     }
