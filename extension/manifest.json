@@ -1,11 +1,11 @@
 {
   "manifest_version": 3,
   "name": "Mini Download Manager",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Passa i download grandi all'app MDM invece di scaricarli in Chrome.",
   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA1y0gO2uFunnT6XWHhT7hevZ5UjL/EaFdl8joEu0RBevxY82h4mMcaLLWi1DI5mCB8okkmSCWA/SXkRq4zW5VEQ4uxJLuGAStC1oKd/XnvSKSutR/MRnSZ/J79Kky9zm8+ZOXOIvxWbzjbQKSPCKB82mg/eEZpezapJhtZi2ZO5fI5j3y1JDGubyZC+ceEC2xqY0ukrNgyP1rYiIJnIrMSvqSqak4DkwjCCVE21GciunuUK6bldIV8uCV+LKHK4I/+q0wvF/RFMPAxf6PiAwdeDiMLh/Cs8LB6Y6+J4LJ8qyrEbZI+NU8m3NH79rFl0qSLp1ikyc8llGyQFmELXy3pwIDAQAB",
   "background": { "service_worker": "background.js" },
-  "permissions": ["downloads", "cookies", "nativeMessaging", "storage"],
+  "permissions": ["downloads", "cookies", "nativeMessaging", "storage", "alarms"],
   "host_permissions": ["<all_urls>"],
   "action": { "default_title": "MDM: click per attivare/disattivare" }
 }

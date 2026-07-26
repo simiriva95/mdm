@@ -1,10 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-mod engine;
-mod host;
-mod server;
-mod ui;
-mod update;
+use mdm::{engine, host, server, ui, update};
 
 use std::sync::Arc;
 

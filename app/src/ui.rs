@@ -78,12 +78,12 @@ fn apply_theme(ctx: &egui::Context) {
     style.visuals.panel_fill = DESK;
     style.visuals.window_fill = PANEL;
     style.visuals.override_text_color = Some(TEXT);
-    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, CHROME);
+    style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0_f32,CHROME);
     style.visuals.widgets.inactive.bg_fill = PANEL_DARK;
     style.visuals.widgets.inactive.weak_bg_fill = PANEL_DARK;
     style.visuals.widgets.hovered.bg_fill = CHROME;
     style.visuals.widgets.hovered.weak_bg_fill = CHROME;
-    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, MUTED);
+    style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0_f32,MUTED);
     style.visuals.widgets.active.bg_fill = CHROME;
     style.visuals.widgets.active.weak_bg_fill = CHROME;
     style.visuals.selection.bg_fill = CHROME;
@@ -308,7 +308,7 @@ impl eframe::App for App {
                             .add(
                                 egui::Button::new(RichText::new(label).color(DESK_TEXT))
                                     .fill(if color == AMBER { AMBER } else { DESK_TAG_OFF })
-                                    .stroke(Stroke::new(1.0, DESK_TEXT))
+                                    .stroke(Stroke::new(1.0_f32,DESK_TEXT))
                                     .rounding(Rounding::same(2.0)),
                             )
                             .on_hover_text("scarica e installa la nuova versione, poi riavvia")
@@ -434,6 +434,10 @@ impl App {
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         if tbtn(ui, "[ clear ]", MUTED) {
                             self.state.log.lock().unwrap().clear();
+                        }
+                        // il log a schermo è solo le ultime 200 righe: il file ha tutto
+                        if tbtn(ui, "[ apri log ]", BLUE) {
+                            reveal(&engine::log_path());
                         }
                     });
                 });
@@ -632,7 +636,7 @@ fn sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>, height: f32) {
     // griglia orizzontale da oscilloscopio: 25/50/75%
     let grid = Color32::from_rgba_unmultiplied(0x8d, 0x94, 0xb8, 26);
     for frac in [0.25f32, 0.5, 0.75] {
-        p.hline(rect.x_range().shrink(2.0), rect.bottom() - rect.height() * frac, Stroke::new(1.0, grid));
+        p.hline(rect.x_range().shrink(2.0), rect.bottom() - rect.height() * frac, Stroke::new(1.0_f32,grid));
     }
     if history.is_empty() {
         return;
@@ -663,7 +667,7 @@ fn sparkline(ui: &mut egui::Ui, history: &VecDeque<f32>, height: f32) {
 fn term_window<R>(ui: &mut egui::Ui, title: &str, accent: Color32, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     let out = egui::Frame::none()
         .fill(PANEL)
-        .stroke(Stroke::new(1.5, PANEL_DARK))
+        .stroke(Stroke::new(1.5_f32,PANEL_DARK))
         .rounding(Rounding::same(4.0))
         .inner_margin(egui::Margin::same(10.0))
         .show(ui, |ui| {
@@ -679,7 +683,7 @@ fn term_window<R>(ui: &mut egui::Ui, title: &str, accent: Color32, add: impl FnO
                 ui.label(RichText::new(title).color(accent).strong());
             });
             let sep_y = ui.cursor().top() + 2.0;
-            ui.painter().hline(ui.max_rect().x_range(), sep_y, Stroke::new(1.0, CHROME));
+            ui.painter().hline(ui.max_rect().x_range(), sep_y, Stroke::new(1.0_f32,CHROME));
             ui.add_space(8.0);
             add(ui)
         });
@@ -689,7 +693,7 @@ fn term_window<R>(ui: &mut egui::Ui, title: &str, accent: Color32, add: impl FnO
     let scan = Color32::from_rgba_unmultiplied(0, 0, 0, 14);
     let mut y = rect.top() + 1.0;
     while y < rect.bottom() {
-        p.hline(rect.x_range().shrink(2.0), y, Stroke::new(1.0, scan));
+        p.hline(rect.x_range().shrink(2.0), y, Stroke::new(1.0_f32,scan));
         y += 3.0;
     }
     out.inner
@@ -701,7 +705,7 @@ fn desk_tag(ui: &mut egui::Ui, text: &str, active: bool) -> bool {
     ui.add(
         egui::Button::new(RichText::new(text).color(DESK_TEXT))
             .fill(fill)
-            .stroke(Stroke::new(1.0, DESK_TEXT))
+            .stroke(Stroke::new(1.0_f32,DESK_TEXT))
             .rounding(Rounding::same(2.0)),
     )
     .clicked()
@@ -711,7 +715,7 @@ fn tbtn(ui: &mut egui::Ui, label: &str, color: Color32) -> bool {
     ui.add(
         egui::Button::new(RichText::new(label).color(color).size(11.0))
             .fill(TRACK)
-            .stroke(Stroke::new(1.0, CHROME))
+            .stroke(Stroke::new(1.0_f32,CHROME))
             .rounding(Rounding::same(2.0)),
     )
     .clicked()

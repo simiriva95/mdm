@@ -7,7 +7,9 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Context as _};
 use futures_util::StreamExt;
-use reqwest::header::{HeaderMap, HeaderValue, CONTENT_DISPOSITION, RANGE, REFERER};
+use reqwest::header::{
+    HeaderMap, HeaderValue, CONTENT_DISPOSITION, ETAG, IF_RANGE, LAST_MODIFIED, RANGE, REFERER,
+};
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
@@ -23,11 +25,11 @@ const SEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 const STEAL_MIN: u64 = 2 * 1024 * 1024;
 // AIMD in salita: dopo questo periodo senza 429 si prova ad aggiungere 1 connessione
 const RAMP_QUIET: std::time::Duration = std::time::Duration::from_secs(45);
-// dopo un crash gli ultimi write potrebbero non essere arrivati su disco
-// (buffer interno di tokio::fs::File): al ripristino arretriamo ogni segmento
-const CRASH_REWIND: u64 = 2 * 1024 * 1024;
+// ogni quanti byte bufferizzati si forza un flush: il sidecar può così avanzare
+// anche a metà segmento, senza aspettare la fine dello stream
+const FLUSH_EVERY: u64 = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Job {
     pub url: String,
     #[serde(default)]
@@ -55,15 +57,28 @@ pub struct Seg {
     // end mobile: il work stealing può restringerlo mentre il segmento scarica
     pub end: AtomicU64,
     pub done: AtomicU64,
+    /// byte usciti dal BufWriter: solo questi sopravvivono a un crash del
+    /// processo, quindi è questo (non `done`) che finisce nel sidecar.
+    pub flushed: AtomicU64,
 }
 
 impl Seg {
     fn new(start: u64, end: u64, done: u64) -> Arc<Self> {
-        Arc::new(Self { start, end: AtomicU64::new(end), done: AtomicU64::new(done) })
+        Arc::new(Self {
+            start,
+            end: AtomicU64::new(end),
+            done: AtomicU64::new(done),
+            flushed: AtomicU64::new(done),
+        })
     }
 
     pub fn end(&self) -> u64 {
         self.end.load(Ordering::Relaxed)
+    }
+
+    /// Da chiamare dopo ogni `flush()`: allinea l'offset sicuro a quello scritto.
+    fn mark_flushed(&self) {
+        self.flushed.store(self.done.load(Ordering::Relaxed), Ordering::Relaxed);
     }
 
     pub fn len(&self) -> u64 {
@@ -105,7 +120,28 @@ pub struct Download {
     pub status: Mutex<Status>,
     pub cancel: AtomicBool,
     pub pause: AtomicBool,
+    /// ETag o Last-Modified del file remoto: va in `If-Range` per accorgersi
+    /// se il file cambia sotto di noi (CDN con varianti, resume dopo giorni).
+    pub validator: Mutex<Option<String>>,
+    /// errore terminale: tutti i worker si fermano e non si ritenta
+    pub fatal: AtomicBool,
+    pub fatal_msg: Mutex<String>,
     pub job: Mutex<Job>,
+}
+
+impl Download {
+    /// Segnala un errore che non ha senso ritentare: ferma tutti i worker.
+    fn set_fatal(&self, msg: impl Into<String>) {
+        *self.fatal_msg.lock().unwrap() = msg.into();
+        self.fatal.store(true, Ordering::Relaxed);
+    }
+
+    /// Il worker deve mollare tutto? (pausa, abort o errore terminale)
+    fn interrupted(&self) -> bool {
+        self.cancel.load(Ordering::Relaxed)
+            || self.pause.load(Ordering::Relaxed)
+            || self.fatal.load(Ordering::Relaxed)
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -113,6 +149,8 @@ struct Sidecar {
     job: Job,
     total: u64,
     resumable: bool,
+    #[serde(default)]
+    validator: Option<String>,
     segments: Vec<SegSave>,
 }
 
@@ -120,6 +158,7 @@ struct Sidecar {
 struct SegSave {
     start: u64,
     end: u64,
+    /// offset *flushed*, non `done`: è il punto da cui si riparte davvero
     done: u64,
 }
 
@@ -140,13 +179,54 @@ pub struct AppState {
     pub rt: Mutex<Option<tokio::runtime::Handle>>,
     /// memoria per host (solo sessione): quante connessioni ha tollerato l'ultima volta
     pub host_conc: Mutex<std::collections::HashMap<String, u64>>,
+    /// cartella di destinazione; vuota = cartella Downloads di sistema
+    pub download_dir: Mutex<PathBuf>,
     next_id: AtomicU64,
 }
 
+/// Cartella dei dati dell'app: `%LOCALAPPDATA%\MDM` (log, config, storico).
+pub fn data_dir() -> PathBuf {
+    let base = dirs::data_local_dir().unwrap_or_else(std::env::temp_dir);
+    let dir = base.join("MDM");
+    let _ = std::fs::create_dir_all(&dir);
+    dir
+}
+
+pub fn log_path() -> PathBuf {
+    data_dir().join("mdm.log")
+}
+
+const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
+
+/// Append su file con rotazione singola. Con `windows_subsystem = "windows"`
+/// stderr non esiste e il log in RAM muore col processo: senza questo, dei bug
+/// rari non resta traccia.
+fn append_log_file(line: &str) {
+    use std::io::Write as _;
+    let path = log_path();
+    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > LOG_MAX_BYTES {
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    }
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{} {line}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    }
+}
+
 impl AppState {
+    /// Dove finiscono i file. Override esplicito, altrimenti Downloads di sistema.
+    pub fn dl_dir(&self) -> anyhow::Result<PathBuf> {
+        let dir = self.download_dir.lock().unwrap().clone();
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(&dir).with_context(|| format!("creazione di {}", dir.display()))?;
+            return Ok(dir);
+        }
+        dirs::download_dir().context("cartella Downloads non trovata")
+    }
+
     pub fn log(&self, line: impl Into<String>) {
         let line = line.into();
         eprintln!("[mdm] {line}");
+        append_log_file(&line);
         let mut log = self.log.lock().unwrap();
         log.push(format!("> {line}"));
         let len = log.len();
@@ -198,6 +278,9 @@ impl AppState {
             status: Mutex::new(Status::Connecting),
             cancel: AtomicBool::new(false),
             pause: AtomicBool::new(false),
+            validator: Mutex::new(None),
+            fatal: AtomicBool::new(false),
+            fatal_msg: Mutex::new(String::new()),
             job: Mutex::new(job),
         })
     }
@@ -236,6 +319,7 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
     }
     dl.pause.store(false, Ordering::Relaxed);
     dl.cancel.store(false, Ordering::Relaxed);
+    dl.fatal.store(false, Ordering::Relaxed);
     state.log(format!("riprendo: {}", dl.name.lock().unwrap()));
     state.repaint();
 
@@ -243,8 +327,15 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
     let part = part_path(&dl.path.lock().unwrap());
 
     let result = if dl.resumable.load(Ordering::Relaxed) && dl.total.load(Ordering::Relaxed) > 0 && part.exists() {
-        // riparte dal punto esatto, segmento per segmento
-        let sum: u64 = dl.segs.lock().unwrap().iter().map(|s| s.done.load(Ordering::Relaxed)).sum();
+        // riparte dal punto esatto: solo i byte flushed sono davvero su disco,
+        // quelli rimasti nel buffer di un worker interrotto vanno riscaricati
+        let sum: u64 = {
+            let segs = dl.segs.lock().unwrap();
+            for s in segs.iter() {
+                s.done.store(s.flushed.load(Ordering::Relaxed), Ordering::Relaxed);
+            }
+            segs.iter().map(|s| s.done.load(Ordering::Relaxed)).sum()
+        };
         dl.done.store(sum, Ordering::Relaxed);
         *dl.status.lock().unwrap() = Status::Active;
         state.repaint();
@@ -282,10 +373,17 @@ fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>)
             state.log(format!("annullato: {}", dl.name.lock().unwrap()));
         }
         Err(e) => {
+            // un errore terminale (file cambiato sul server) arriva per primo
+            // sul flag, mentre `e` può essere l'"interrotto" di un altro worker
+            let msg = if dl.fatal.load(Ordering::Relaxed) {
+                dl.fatal_msg.lock().unwrap().clone()
+            } else {
+                format!("{e:#}")
+            };
             // file e sidecar restano: [resume] ritenta da dove era arrivato
-            *status = Status::Failed(format!("{e:#}"));
+            *status = Status::Failed(msg.clone());
             let _ = write_sidecar(dl, &part);
-            state.log(format!("ERRORE: {e:#} — url: {}", dl.job.lock().unwrap().url));
+            state.log(format!("ERRORE: {msg} — url: {}", dl.job.lock().unwrap().url));
         }
     }
     drop(status);
@@ -302,7 +400,7 @@ pub fn discard(dl: &Download) {
 
 /// All'avvio: cerca sidecar in Downloads e ricrea i download in pausa.
 pub fn scan_resumable(state: &Arc<AppState>) {
-    let Some(dir) = dirs::download_dir() else { return };
+    let Ok(dir) = state.dl_dir() else { return };
     let Ok(rd) = std::fs::read_dir(&dir) else { return };
     for entry in rd.flatten() {
         let sc_path = entry.path();
@@ -325,14 +423,10 @@ pub fn scan_resumable(state: &Arc<AppState>) {
         *dl.path.lock().unwrap() = path;
         dl.total.store(sc.total, Ordering::Relaxed);
         dl.resumable.store(sc.resumable, Ordering::Relaxed);
-        let segs: Vec<Arc<Seg>> = sc
-            .segments
-            .iter()
-            .map(|s| {
-                let safe_done = if sc.resumable { s.done.saturating_sub(CRASH_REWIND) } else { 0 };
-                Seg::new(s.start, s.end, safe_done)
-            })
-            .collect();
+        *dl.validator.lock().unwrap() = sc.validator;
+        // `done` nel sidecar è già l'offset flushed: nessun rewind da fare
+        let segs: Vec<Arc<Seg>> =
+            sc.segments.iter().map(|s| Seg::new(s.start, s.end, if sc.resumable { s.done } else { 0 })).collect();
         dl.done.store(segs.iter().map(|s| s.done.load(Ordering::Relaxed)).sum(), Ordering::Relaxed);
         *dl.segs.lock().unwrap() = segs;
         *dl.status.lock().unwrap() = Status::Paused;
@@ -389,6 +483,18 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
             .filter(|l| *l > 0)
     };
 
+    // ETag/Last-Modified: identità del file remoto, usata poi in If-Range
+    let validator = probe
+        .headers()
+        .get(ETAG)
+        .or_else(|| probe.headers().get(LAST_MODIFIED))
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.to_string());
+    if validator.is_none() {
+        state.log("il server non manda ETag/Last-Modified: resume non verificabile");
+    }
+    *dl.validator.lock().unwrap() = validator;
+
     let path = if fresh {
         let raw_name = if !job.filename.is_empty() {
             job.filename.clone()
@@ -397,8 +503,8 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
         } else {
             filename_from_url(&job.url)
         };
-        let dir = dirs::download_dir().context("cartella Downloads non trovata")?;
-        dedupe_path(&dir.join(sanitize_filename(&raw_name)))
+        let dir = state.dl_dir()?;
+        reserve_path(&dir.join(sanitize_filename(&raw_name)))?
     } else {
         dl.path.lock().unwrap().clone() // resume da zero: stesso file
     };
@@ -451,7 +557,14 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
 }
 
 async fn finalize(dl: &Download, part: &Path) -> anyhow::Result<PathBuf> {
-    let path = dl.path.lock().unwrap().clone();
+    let mut path = dl.path.lock().unwrap().clone();
+    // qualcuno ha creato quel file mentre scaricavamo: su Windows `rename` usa
+    // MOVEFILE_REPLACE_EXISTING e lo cancellerebbe senza dire niente
+    if path.exists() {
+        path = free_name(&path);
+        *dl.path.lock().unwrap() = path.clone();
+        *dl.name.lock().unwrap() = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    }
     tokio::fs::rename(part, &path).await?;
     let _ = std::fs::remove_file(sidecar_path(part));
     Ok(path)
@@ -501,7 +614,9 @@ fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
         .pool_max_idle_per_host(MAX_SEGMENTS as usize);
     if let Some(p) = system_proxy() {
         if let Ok(proxy) = reqwest::Proxy::all(&p) {
-            builder = builder.proxy(proxy);
+            // il proxy aziendale non deve inghiottire localhost e intranet,
+            // altrimenti i download da host locali falliscono sempre
+            builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")));
         }
     }
     let client = builder.build().expect("client http");
@@ -589,6 +704,9 @@ impl Gate {
 
 enum SegErr {
     RateLimited(Option<u64>), // Retry-After in secondi, se il server lo dice
+    /// If-Range non combacia: il file sul server è cambiato. Ritentare
+    /// scriverebbe pezzi di due versioni diverse nello stesso .part.
+    Changed,
     Other(anyhow::Error),
 }
 
@@ -598,10 +716,10 @@ impl<E: Into<anyhow::Error>> From<E> for SegErr {
     }
 }
 
-/// Sonnellino interrompibile: esce subito su pausa/cancel.
+/// Sonnellino interrompibile: esce subito su pausa/cancel/errore terminale.
 async fn nap(dl: &Download, secs: u64) {
     for _ in 0..secs * 2 {
-        if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
+        if dl.interrupted() {
             return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
@@ -716,8 +834,16 @@ async fn work_segment(
     let mut attempts = 0u32;
     let mut rl_hits = 0u32;
     loop {
-        if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
+        if dl.interrupted() {
             bail!("interrotto");
+        }
+        // Il tentativo precedente può aver contato byte rimasti nel BufWriter e
+        // mai finiti su disco. Ripartire da `done` lascerebbe un buco nel file:
+        // si riparte sempre dall'ultimo offset flushato.
+        let flushed = seg.flushed.load(Ordering::Relaxed);
+        let lost = seg.done.swap(flushed, Ordering::Relaxed).saturating_sub(flushed);
+        if lost > 0 {
+            dl.done.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(lost))).ok();
         }
         let before = seg.done.load(Ordering::Relaxed);
         gate.enter().await;
@@ -730,6 +856,11 @@ async fn work_segment(
         }
         match res {
             Ok(()) => return Ok(()),
+            Err(SegErr::Changed) => {
+                let msg = "il file sul server è cambiato: annulla e riscarica da capo";
+                dl.set_fatal(msg);
+                bail!("{msg}");
+            }
             Err(SegErr::RateLimited(retry_after)) => {
                 rl_hits += 1;
                 if rl_hits > 12 {
@@ -763,12 +894,18 @@ async fn fetch_segment(
     if start > seg.end() {
         return Ok(());
     }
-    let resp = tokio::time::timeout(
-        SEND_TIMEOUT,
-        client.get(url).headers(headers.clone()).header(RANGE, format!("bytes={start}-{}", seg.end())).send(),
-    )
-    .await
-    .map_err(|_| SegErr::Other(anyhow::anyhow!("il server non risponde (timeout {}s)", SEND_TIMEOUT.as_secs())))??;
+    // If-Range: se il file è cambiato il server risponde 200 invece di 206,
+    // così ce ne accorgiamo prima di cucire insieme due versioni diverse
+    let validator = dl.validator.lock().unwrap().clone();
+    let mut req = client.get(url).headers(headers.clone()).header(RANGE, format!("bytes={start}-{}", seg.end()));
+    if let Some(v) = &validator {
+        if let Ok(v) = HeaderValue::from_str(v) {
+            req = req.header(IF_RANGE, v);
+        }
+    }
+    let resp = tokio::time::timeout(SEND_TIMEOUT, req.send())
+        .await
+        .map_err(|_| SegErr::Other(anyhow::anyhow!("il server non risponde (timeout {}s)", SEND_TIMEOUT.as_secs())))??;
     if resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
         let retry_after = resp
             .headers()
@@ -778,6 +915,11 @@ async fn fetch_segment(
         return Err(SegErr::RateLimited(retry_after));
     }
     if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        // 200 con If-Range mandato = il validator non combacia più: terminale.
+        // Senza validator resta un 200 ambiguo (nodo del CDN senza Range): si ritenta.
+        if resp.status() == reqwest::StatusCode::OK && validator.is_some() {
+            return Err(SegErr::Changed);
+        }
         return Err(SegErr::Other(anyhow::anyhow!("range rifiutato dal server (status {})", resp.status())));
     }
 
@@ -787,23 +929,33 @@ async fn fetch_segment(
     // CRASH_REWIND (2MB) copre abbondantemente quanto può restare in buffer.
     let mut file = tokio::io::BufWriter::with_capacity(512 * 1024, raw);
     let mut pos = start;
+    let mut since_flush = 0u64;
     let mut stream = resp.bytes_stream();
     loop {
-        if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
+        if dl.interrupted() {
             file.flush().await?;
+            seg.mark_flushed();
             return Err(SegErr::Other(anyhow::anyhow!("interrotto")));
         }
         // watchdog anti-stallo: connessione morta = errore = riconnessione
         let chunk = match tokio::time::timeout(STALL_TIMEOUT, stream.next()).await {
             Err(_) => {
                 file.flush().await?;
+                seg.mark_flushed();
                 return Err(SegErr::Other(anyhow::anyhow!(
                     "stallo: nessun dato per {}s, riconnetto",
                     STALL_TIMEOUT.as_secs()
                 )));
             }
             Ok(None) => break,
-            Ok(Some(c)) => c?,
+            Ok(Some(Ok(c))) => c,
+            Ok(Some(Err(e))) => {
+                // connessione caduta a metà: salva quello che è arrivato, così
+                // il retry riparte da lì invece di rileggere da capo
+                file.flush().await?;
+                seg.mark_flushed();
+                return Err(SegErr::Other(anyhow::Error::new(e).context("stream interrotto")));
+            }
         };
         // il work stealing può aver ristretto end: scrivi solo la parte nostra
         let end = seg.end();
@@ -815,11 +967,20 @@ async fn fetch_segment(
         pos += take as u64;
         seg.done.fetch_add(take as u64, Ordering::Relaxed);
         dl.done.fetch_add(take as u64, Ordering::Relaxed);
+        // flush periodico: fa avanzare l'offset sicuro del sidecar anche a
+        // metà segmento, così un crash costa al massimo FLUSH_EVERY byte
+        since_flush += take as u64;
+        if since_flush >= FLUSH_EVERY {
+            file.flush().await?;
+            seg.mark_flushed();
+            since_flush = 0;
+        }
         if take < chunk.len() {
             break; // fine del segmento (ristretto): il resto è del ladro
         }
     }
     file.flush().await?;
+    seg.mark_flushed();
     // il server può chiudere lo stream a metà: prima veniva ignorato e il file
     // finiva con un buco. Ora è un errore e il retry riparte dal byte esatto.
     if seg.start + seg.done.load(Ordering::Relaxed) <= seg.end() {
@@ -852,7 +1013,7 @@ async fn single_stream(
     let mut written = 0u64;
     let mut stream = resp.bytes_stream();
     loop {
-        if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
+        if dl.interrupted() {
             file.flush().await?;
             bail!("interrotto");
         }
@@ -862,7 +1023,11 @@ async fn single_stream(
                 bail!("stallo: nessun dato per {}s", STALL_TIMEOUT.as_secs());
             }
             Ok(None) => break,
-            Ok(Some(c)) => c?,
+            Ok(Some(Ok(c))) => c,
+            Ok(Some(Err(e))) => {
+                file.flush().await?;
+                return Err(anyhow::Error::new(e).context("stream interrotto"));
+            }
         };
         file.write_all(&chunk).await?;
         written += chunk.len() as u64;
@@ -872,6 +1037,9 @@ async fn single_stream(
         }
     }
     file.flush().await?;
+    if let Some(seg) = &seg {
+        seg.mark_flushed();
+    }
     let total = dl.total.load(Ordering::Relaxed);
     if total > 0 && written < total {
         bail!("connessione chiusa in anticipo ({} su {})", crate::ui::fmt_bytes(written), crate::ui::fmt_bytes(total));
@@ -884,12 +1052,14 @@ fn write_sidecar(dl: &Download, part: &Path) -> anyhow::Result<()> {
         job: dl.job.lock().unwrap().clone(),
         total: dl.total.load(Ordering::Relaxed),
         resumable: dl.resumable.load(Ordering::Relaxed),
+        validator: dl.validator.lock().unwrap().clone(),
         segments: dl
             .segs
             .lock()
             .unwrap()
             .iter()
-            .map(|s| SegSave { start: s.start, end: s.end(), done: s.done.load(Ordering::Relaxed).min(s.len()) })
+            // `flushed`, non `done`: solo questi byte sopravvivono a un crash
+            .map(|s| SegSave { start: s.start, end: s.end(), done: s.flushed.load(Ordering::Relaxed).min(s.len()) })
             .collect(),
     };
     std::fs::write(sidecar_path(part), serde_json::to_vec(&sc)?)?;
@@ -932,6 +1102,12 @@ fn split_segments(len: u64, max_parts: u64, min_size: u64) -> Vec<(u64, u64)> {
         .collect()
 }
 
+/// Nomi DOS che su Windows non sono file: `CON.zip` non si può creare.
+const RESERVED: [&str; 22] = [
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8", "COM9", "LPT1",
+    "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
 fn sanitize_filename(name: &str) -> String {
     let cleaned: String = name
         .chars()
@@ -942,20 +1118,45 @@ fn sanitize_filename(name: &str) -> String {
         })
         .collect();
     let cleaned = cleaned.trim_matches(|c| c == '.' || c == ' ').to_string();
-    if cleaned.is_empty() { "download".to_string() } else { cleaned }
+    if cleaned.is_empty() {
+        return "download".to_string();
+    }
+    // il nome riservato vale anche con estensione, e conta solo lo stem
+    let stem = cleaned.split('.').next().unwrap_or("").to_ascii_uppercase();
+    if RESERVED.contains(&stem.as_str()) { format!("_{cleaned}") } else { cleaned }
 }
 
-fn dedupe_path(path: &Path) -> PathBuf {
-    if !path.exists() && !part_path(path).exists() {
+/// `file.zip`, `file (1).zip`, `file (2).zip`, ...
+fn nth_candidate(path: &Path, i: u32) -> PathBuf {
+    if i == 0 {
         return path.to_path_buf();
     }
     let stem = path.file_stem().unwrap_or_default().to_string_lossy();
     let ext = path.extension().map(|e| format!(".{}", e.to_string_lossy())).unwrap_or_default();
-    let dir = path.parent().unwrap_or(Path::new("."));
-    (1..)
-        .map(|i| dir.join(format!("{stem} ({i}){ext}")))
-        .find(|p| !p.exists() && !part_path(p).exists())
-        .unwrap()
+    path.parent().unwrap_or(Path::new(".")).join(format!("{stem} ({i}){ext}"))
+}
+
+/// Sceglie un nome libero e **riserva** subito il `.part` con `create_new`:
+/// due job concorrenti con lo stesso nome non possono più collidere, perché
+/// la creazione atomica del file fa da lock.
+fn reserve_path(path: &Path) -> anyhow::Result<PathBuf> {
+    for i in 0..10_000 {
+        let cand = nth_candidate(path, i);
+        if cand.exists() {
+            continue;
+        }
+        match std::fs::OpenOptions::new().write(true).create_new(true).open(part_path(&cand)) {
+            Ok(_) => return Ok(cand),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e).context("creazione del file .part"),
+        }
+    }
+    bail!("troppi file con lo stesso nome in Downloads")
+}
+
+/// Primo nome non occupato, senza riservare nulla (usato appena prima del rename).
+fn free_name(path: &Path) -> PathBuf {
+    (0..).map(|i| nth_candidate(path, i)).find(|p| !p.exists()).unwrap_or_else(|| path.to_path_buf())
 }
 
 fn part_path(path: &Path) -> PathBuf {
@@ -1030,6 +1231,45 @@ mod tests {
         assert_eq!(sanitize_filename("a<b>c:d.zip"), "a_b_c_d.zip");
         assert_eq!(sanitize_filename("..."), "download");
         assert_eq!(sanitize_filename("ok name.iso"), "ok name.iso");
+    }
+
+    #[test]
+    fn sanitize_reserved_dos_names() {
+        // su Windows questi non sono file: senza prefisso la create fallisce
+        assert_eq!(sanitize_filename("CON"), "_CON");
+        assert_eq!(sanitize_filename("con.zip"), "_con.zip");
+        assert_eq!(sanitize_filename("LPT9.tar.gz"), "_LPT9.tar.gz");
+        // simili ma legittimi: non toccarli
+        assert_eq!(sanitize_filename("CONSOLE.zip"), "CONSOLE.zip");
+        assert_eq!(sanitize_filename("COM10.bin"), "COM10.bin");
+    }
+
+    #[test]
+    fn candidates_numbered() {
+        let p = Path::new("/d/file.zip");
+        assert_eq!(nth_candidate(p, 0), PathBuf::from("/d/file.zip"));
+        assert_eq!(nth_candidate(p, 2), PathBuf::from("/d/file (2).zip"));
+        assert_eq!(nth_candidate(Path::new("/d/noext"), 1), PathBuf::from("/d/noext (1)"));
+    }
+
+    #[test]
+    fn reserve_locks_the_name() {
+        let dir = std::env::temp_dir().join(format!("mdm-reserve-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("f.zip");
+
+        // il primo prende f.zip e ne riserva il .part
+        let a = reserve_path(&target).unwrap();
+        assert_eq!(a, target);
+        assert!(part_path(&a).exists());
+        // il secondo non può riprendersi lo stesso nome
+        let b = reserve_path(&target).unwrap();
+        assert_eq!(b, dir.join("f (1).zip"));
+        // nome gia' occupato da un file vero: si salta
+        std::fs::write(dir.join("f (2).zip"), b"x").unwrap();
+        assert_eq!(reserve_path(&target).unwrap(), dir.join("f (3).zip"));
+
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -1121,14 +1361,38 @@ mod tests {
             },
             total: 1000,
             resumable: true,
+            validator: Some("\"abc123\"".into()),
             segments: vec![SegSave { start: 0, end: 499, done: 100 }, SegSave { start: 500, end: 999, done: 0 }],
         };
         let raw = serde_json::to_vec(&sc).unwrap();
         let back: Sidecar = serde_json::from_slice(&raw).unwrap();
         assert_eq!(back.total, 1000);
         assert!(back.resumable);
+        assert_eq!(back.validator.as_deref(), Some("\"abc123\""));
         assert_eq!(back.segments.len(), 2);
         assert_eq!(back.segments[0].done, 100);
         assert_eq!(back.job.cookies, "a=1");
+    }
+
+    #[test]
+    fn sidecar_without_validator_still_parses() {
+        // sidecar scritti da versioni precedenti devono restare leggibili
+        let raw = br#"{"job":{"url":"u"},"total":10,"resumable":true,"segments":[]}"#;
+        let back: Sidecar = serde_json::from_slice(raw).unwrap();
+        assert_eq!(back.validator, None);
+        assert_eq!(back.total, 10);
+    }
+
+    #[test]
+    fn flushed_trails_done() {
+        let s = Seg::new(0, 999, 0);
+        s.done.store(500, Ordering::Relaxed);
+        // niente flush: l'offset sicuro non si è mosso
+        assert_eq!(s.flushed.load(Ordering::Relaxed), 0);
+        s.mark_flushed();
+        assert_eq!(s.flushed.load(Ordering::Relaxed), 500);
+        // ripartendo da sidecar, done e flushed coincidono
+        let restored = Seg::new(0, 999, 500);
+        assert_eq!(restored.done.load(Ordering::Relaxed), restored.flushed.load(Ordering::Relaxed));
     }
 }
