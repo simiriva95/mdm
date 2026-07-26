@@ -2378,6 +2378,7 @@ name = "mdm"
 version = "0.4.1"
 dependencies = [
  "anyhow",
+ "arboard",
  "chrono",
  "dirs 5.0.1",
  "eframe",

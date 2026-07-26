@@ -46,6 +46,8 @@ pub struct Job {
 
 #[derive(Clone, PartialEq)]
 pub enum Status {
+    /// in attesa di uno slot: ci sono già `max_concurrent_downloads` attivi
+    Queued,
     Connecting,
     Active,
     Paused,
@@ -128,6 +130,14 @@ pub struct Download {
     /// errore terminale: tutti i worker si fermano e non si ritenta
     pub fatal: AtomicBool,
     pub fatal_msg: Mutex<String>,
+    /// tentativi automatici già consumati
+    pub retries: AtomicU64,
+    /// posizione in coda mostrata dalla UI (0 = il prossimo)
+    pub queue_pos: AtomicU64,
+    /// inizio del download, per la durata in cronologia
+    pub started: std::time::Instant,
+    /// limite di banda condiviso con tutti gli altri download
+    pub limiter: Arc<crate::limiter::Limiter>,
     pub job: Mutex<Job>,
 }
 
@@ -181,6 +191,10 @@ pub struct AppState {
     pub rt: Mutex<Option<tokio::runtime::Handle>>,
     /// impostazioni persistite: cartella, connessioni, banda, memoria per host
     pub config: Arc<crate::config::Store>,
+    /// limite di banda globale (0 = illimitato)
+    pub limiter: Arc<crate::limiter::Limiter>,
+    /// quanti download possono girare insieme; gli altri aspettano il turno
+    pub queue: crate::queue::Queue,
     next_id: AtomicU64,
 }
 
@@ -216,7 +230,18 @@ impl AppState {
     /// Stato con una config già caricata (il binario); `default()` ne usa una
     /// in memoria, così i test non leggono né sporcano quella dell'utente.
     pub fn with_config(config: Arc<crate::config::Store>) -> Self {
-        Self { config, ..Default::default() }
+        let state = Self { config, ..Default::default() };
+        state.apply_config();
+        state
+    }
+
+    /// Propaga i valori della config agli oggetti runtime. Da richiamare
+    /// quando la config cambia, così banda e coda reagiscono agli slider
+    /// senza riavviare i download.
+    pub fn apply_config(&self) {
+        let cfg = self.config.get();
+        self.limiter.set_limit(cfg.speed_limit_kbps);
+        self.queue.set_limit(cfg.max_concurrent_downloads);
     }
 
     /// Dove finiscono i file. Override da config, altrimenti Downloads di sistema.
@@ -292,6 +317,10 @@ impl AppState {
             validator: Mutex::new(None),
             fatal: AtomicBool::new(false),
             fatal_msg: Mutex::new(String::new()),
+            retries: AtomicU64::new(0),
+            queue_pos: AtomicU64::new(0),
+            started: std::time::Instant::now(),
+            limiter: self.limiter.clone(),
             job: Mutex::new(job),
         })
     }
@@ -302,7 +331,10 @@ pub async fn run_job(state: Arc<AppState>, job: Job) {
     {
         let dup = state.downloads.lock().unwrap().iter().any(|d| {
             d.job.lock().unwrap().url == job.url
-                && matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting | Status::Paused)
+                && matches!(
+                    *d.status.lock().unwrap(),
+                    Status::Active | Status::Connecting | Status::Paused | Status::Queued
+                )
         });
         if dup {
             state.log(format!("ignorato (già in lista): {}", job.url));
@@ -311,12 +343,75 @@ pub async fn run_job(state: Arc<AppState>, job: Job) {
         }
     }
     let dl = state.new_download(job.clone());
+    *dl.status.lock().unwrap() = Status::Queued;
     state.downloads.lock().unwrap().push(dl.clone());
     state.log(format!("nuovo job: {}", job.url));
     state.wake_and_show();
 
+    // attesa del turno: con la coda piena questo download resta Queued
+    let ticket = state.queue.ticket();
+    let slot = {
+        let dl = dl.clone();
+        let state2 = state.clone();
+        let pos = state.queue.position(ticket);
+        if pos > 0 {
+            dl.queue_pos.store(pos, Ordering::Relaxed);
+            state.log(format!("in coda ({pos} davanti): {}", dl.name.lock().unwrap()));
+            state.repaint();
+        }
+        // aggiorna la posizione mostrata mentre si aspetta
+        let ticker = {
+            let dl = dl.clone();
+            let state = state2.clone();
+            tokio::spawn(async move {
+                loop {
+                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                    dl.queue_pos.store(state.queue.position(ticket), Ordering::Relaxed);
+                    state.repaint();
+                }
+            })
+        };
+        let slot = state.queue.enter(ticket, || dl.cancel.load(Ordering::Relaxed)).await;
+        ticker.abort();
+        slot
+    };
+    let Some(_slot) = slot else {
+        *dl.status.lock().unwrap() = Status::Cancelled;
+        state.log(format!("annullato in coda: {}", dl.name.lock().unwrap()));
+        state.repaint();
+        return;
+    };
+    dl.queue_pos.store(0, Ordering::Relaxed);
+    *dl.status.lock().unwrap() = Status::Connecting;
+    state.repaint();
+
     let result = download(&state, &dl, &job, true).await;
     finish(&state, &dl, result);
+    retry_loop(&state, &dl).await;
+}
+
+/// Ritenta da solo un download fallito, con backoff crescente. Gli errori
+/// terminali (4xx, file cambiato sul server) non passano di qui: ritentarli
+/// sarebbe solo rumore.
+async fn retry_loop(state: &Arc<AppState>, dl: &Arc<Download>) {
+    const BACKOFF: [u64; 3] = [5, 15, 45];
+    loop {
+        let max = state.config.get().auto_retry;
+        let n = dl.retries.load(Ordering::Relaxed);
+        let failed = matches!(*dl.status.lock().unwrap(), Status::Failed(_));
+        if !failed || n >= max || dl.fatal.load(Ordering::Relaxed) || dl.cancel.load(Ordering::Relaxed) {
+            return;
+        }
+        dl.retries.store(n + 1, Ordering::Relaxed);
+        let wait = BACKOFF[(n as usize).min(BACKOFF.len() - 1)];
+        state.log(format!("ritento tra {wait}s ({}/{max}): {}", n + 1, dl.name.lock().unwrap()));
+        state.repaint();
+        nap(dl, wait).await;
+        if dl.cancel.load(Ordering::Relaxed) || dl.pause.load(Ordering::Relaxed) {
+            return;
+        }
+        resume(state.clone(), dl.clone()).await;
+    }
 }
 
 /// Riprende un download in pausa/fallito/ripristinato da sidecar.
@@ -368,6 +463,7 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
 
 fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>) {
     let part = part_path(&dl.path.lock().unwrap());
+    let ok = result.is_ok();
     let mut status = dl.status.lock().unwrap();
     match result {
         Ok(path) => {
@@ -399,7 +495,21 @@ fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>)
             state.log(format!("ERRORE: {msg} — url: {}", dl.job.lock().unwrap().url));
         }
     }
+    let terminal = !matches!(*status, Status::Paused);
     drop(status);
+
+    // cronologia: solo esiti definitivi, una pausa non è la fine di niente
+    if terminal {
+        crate::history::append(&crate::history::Entry {
+            name: dl.name.lock().unwrap().clone(),
+            url: dl.job.lock().unwrap().url.clone(),
+            path: dl.path.lock().unwrap().clone(),
+            bytes: dl.done.load(Ordering::Relaxed),
+            secs: dl.started.elapsed().as_secs(),
+            at: crate::history::now_epoch(),
+            ok,
+        });
+    }
     state.repaint();
 }
 
@@ -473,7 +583,15 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
         .context("il server non risponde (timeout)")?
         .context("connessione fallita")?;
     }
-    anyhow::ensure!(probe.status().is_success(), "status {}", probe.status());
+    if !probe.status().is_success() {
+        let st = probe.status();
+        // 404/403/410...: il link è morto o richiede altro. Ritentare da soli
+        // non serve a niente, meglio dirlo subito e fermarsi.
+        if st.is_client_error() && st != reqwest::StatusCode::REQUEST_TIMEOUT && st.as_u16() != 429 {
+            dl.set_fatal(format!("il server rifiuta il download (status {st})"));
+        }
+        bail!("status {st}");
+    }
 
     let disp_name = probe
         .headers()
@@ -530,7 +648,10 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
     *dl.status.lock().unwrap() = Status::Active;
     state.repaint();
 
-    let segmented = ranges && len.is_some_and(|l| l >= 2 * MIN_SEGMENT);
+    // Basta che il server supporti Range: anche un file piccolo passa dal
+    // percorso segmentato (con un solo segmento), così ha sidecar e resume
+    // esatto. Prima ripartiva da zero a ogni intoppo.
+    let segmented = ranges && len.is_some();
     dl.resumable.store(segmented, Ordering::Relaxed);
 
     if segmented {
@@ -543,7 +664,9 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
             .collect();
         // se questo host ha già protestato (429), riparti prudente
         let start_conc = remembered_conc(state, &job.url);
-        if start_conc < max_conc {
+        if segs.len() == 1 {
+            state.log(format!("1 connessione ({}), resume disponibile", crate::ui::fmt_bytes(len)));
+        } else if start_conc < max_conc {
             state.log(format!("{} segmenti, parto con {start_conc} connessioni (host già rate-limitato)", segs.len()));
         } else {
             state.log(format!("{} segmenti paralleli, {}", segs.len(), crate::ui::fmt_bytes(len)));
@@ -982,6 +1105,7 @@ async fn fetch_segment(
             break;
         }
         let take = chunk.len().min((end - pos + 1) as usize);
+        dl.limiter.acquire(take as u64).await;
         file.write_all(&chunk[..take]).await?;
         pos += take as u64;
         seg.done.fetch_add(take as u64, Ordering::Relaxed);
@@ -1048,6 +1172,7 @@ async fn single_stream(
                 return Err(anyhow::Error::new(e).context("stream interrotto"));
             }
         };
+        dl.limiter.acquire(chunk.len() as u64).await;
         file.write_all(&chunk).await?;
         written += chunk.len() as u64;
         dl.done.fetch_add(chunk.len() as u64, Ordering::Relaxed);

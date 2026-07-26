@@ -138,6 +138,14 @@ struct App {
     celebrated: HashSet<u64>, // download già festeggiati
     /// buffer del campo cartella: la config tiene un PathBuf, la UI una String
     dir_buf: String,
+    /// campo "incolla un link"
+    url_buf: String,
+    /// ultimo testo visto negli appunti, per non riproporlo in loop
+    last_clip: String,
+    last_clip_check: Instant,
+    /// cronologia caricata da disco, ricaricata quando cambia qualcosa
+    history: Vec<crate::history::Entry>,
+    show_history: bool,
     #[cfg(windows)]
     _tray: Option<Tray>,
     quitting: bool,
@@ -155,6 +163,11 @@ impl App {
             confetti: Vec::new(),
             celebrated: HashSet::new(),
             dir_buf: state.config.get().download_dir.to_string_lossy().into_owned(),
+            url_buf: String::new(),
+            last_clip: String::new(),
+            last_clip_check: Instant::now(),
+            history: crate::history::load(),
+            show_history: false,
             #[cfg(windows)]
             _tray: Tray::build(state),
             quitting: false,
@@ -344,6 +357,22 @@ impl eframe::App for App {
         // salvataggio pigro della config: gli slider muovono i valori a ogni
         // frame, il write su disco avviene solo quando si smette di toccarli
         self.state.config.flush_due();
+        // banda e coda seguono gli slider senza riavviare i download
+        self.state.apply_config();
+
+        self.poll_clipboard();
+
+        // trascinare un link o un file .txt con URL dentro la finestra
+        let dropped: Vec<String> = ctx.input(|i| {
+            i.raw
+                .dropped_files
+                .iter()
+                .filter_map(|f| f.path.as_ref().map(|p| p.to_string_lossy().into_owned()))
+                .collect()
+        });
+        for text in dropped {
+            self.enqueue_url(&text);
+        }
 
         self.paint_confetti(ctx, ctx.input(|i| i.time));
 
@@ -362,6 +391,24 @@ impl App {
         ui.allocate_ui(vec2(ui.available_width(), top_h), |ui| {
             term_window(ui, &title, PINK, |ui| {
                 ui.set_min_height(top_h - 50.0);
+
+                // riga "incolla un link": l'app non dipende più solo da Chrome
+                ui.horizontal(|ui| {
+                    ui.label(RichText::new("mdm>").color(MINT).strong());
+                    let resp = ui.add(
+                        egui::TextEdit::singleline(&mut self.url_buf)
+                            .desired_width(ui.available_width() - 70.0)
+                            .hint_text("incolla un URL e premi invio (o trascina un link qui)"),
+                    );
+                    let entered = resp.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if entered || tbtn(ui, "[ + ]", MINT) {
+                        let url = std::mem::take(&mut self.url_buf);
+                        self.enqueue_url(&url);
+                        resp.request_focus();
+                    }
+                });
+                ui.add_space(4.0);
+
                 if downloads.is_empty() {
                     let t = ui.input(|i| i.time);
                     ui.add_space(20.0);
@@ -411,6 +458,7 @@ impl App {
                     for dl in downloads.iter().rev() {
                         self.download_row(ui, dl, &mut to_remove);
                     }
+                    self.history_section(ui);
                 });
             });
         });
@@ -435,6 +483,97 @@ impl App {
             });
             sparkline(ui, &self.net_history, 46.0);
         });
+    }
+
+    /// Se negli appunti compare il link a un file scaricabile, lo propone nel
+    /// campo URL. Non parte mai da solo: copiare un link non è un ordine.
+    fn poll_clipboard(&mut self) {
+        if !self.state.config.get().clipboard_watch {
+            return;
+        }
+        if self.last_clip_check.elapsed() < Duration::from_millis(800) {
+            return;
+        }
+        self.last_clip_check = Instant::now();
+        let Ok(mut cb) = arboard::Clipboard::new() else { return };
+        let Ok(text) = cb.get_text() else { return };
+        let text = text.trim().to_string();
+        if text == self.last_clip || text.len() > 2000 {
+            return;
+        }
+        self.last_clip = text.clone();
+        if !text.starts_with("http://") && !text.starts_with("https://") {
+            return;
+        }
+        // solo link che sembrano file: un link a una pagina web non interessa
+        let name = text.split(['?', '#']).next().unwrap_or("").rsplit('/').next().unwrap_or("");
+        let ext = name.rsplit_once('.').map(|(_, e)| e.to_ascii_lowercase()).unwrap_or_default();
+        const DOWNLOADABLE: [&str; 22] = [
+            "zip", "7z", "rar", "gz", "bz2", "xz", "tar", "iso", "img", "bin", "exe", "msi", "dmg", "pkg", "deb",
+            "rpm", "appimage", "mp4", "mkv", "pdf", "flac", "wav",
+        ];
+        if DOWNLOADABLE.contains(&ext.as_str()) && self.url_buf.is_empty() {
+            self.url_buf = text;
+            self.tab = Tab::Downloads;
+            self.state.log("link negli appunti: pronto nel campo, premi invio per scaricarlo");
+        }
+    }
+
+    /// Storico dei download conclusi, richiudibile. Sopravvive al riavvio:
+    /// prima i completati sparivano e non restava traccia di cosa fosse
+    /// passato di lì.
+    fn history_section(&mut self, ui: &mut egui::Ui) {
+        if self.history.is_empty() {
+            return;
+        }
+        ui.add_space(8.0);
+        ui.horizontal(|ui| {
+            let arrow = if self.show_history { "▾" } else { "▸" };
+            if tbtn(ui, &format!("[ {arrow} storico ({}) ]", self.history.len()), MUTED) {
+                self.show_history = !self.show_history;
+                if self.show_history {
+                    self.history = crate::history::load();
+                }
+            }
+            if self.show_history && tbtn(ui, "[ svuota ]", MUTED) {
+                crate::history::clear();
+                self.history.clear();
+            }
+        });
+        if !self.show_history {
+            return;
+        }
+        let mut redownload: Option<String> = None;
+        for e in self.history.iter().take(50) {
+            ui.horizontal(|ui| {
+                let (mark, color) = if e.ok { ("✔", MINT) } else { ("✗", RED) };
+                ui.label(RichText::new(mark).color(color).size(11.0));
+                ui.add(egui::Label::new(RichText::new(&e.name).color(MUTED).size(11.0)).truncate());
+                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                    if tbtn(ui, "[ ↻ ]", BLUE) {
+                        redownload = Some(e.url.clone());
+                    }
+                    if e.ok && e.path.exists() && tbtn(ui, "[ open ]", BLUE) {
+                        reveal(&e.path);
+                    }
+                    ui.label(RichText::new(fmt_bytes(e.bytes)).color(CHROME).size(10.0));
+                });
+            });
+        }
+        if let Some(url) = redownload {
+            self.enqueue_url(&url);
+        }
+    }
+
+    /// Accoda un URL scritto, incollato o trascinato. Ignora ciò che non è
+    /// un link http(s): un percorso di file locale non è un download.
+    fn enqueue_url(&mut self, raw: &str) {
+        let url = raw.trim();
+        if !url.starts_with("http://") && !url.starts_with("https://") {
+            return;
+        }
+        let Some(rt) = self.state.rt.lock().unwrap().clone() else { return };
+        rt.spawn(engine::run_job(self.state.clone(), engine::Job { url: url.to_string(), ..Default::default() }));
     }
 
     /// Impostazioni: stessa estetica delle altre finestre, una riga per voce.
@@ -579,6 +718,7 @@ impl App {
                     let t = ui.input(|i| i.time);
                     let spin = ["|", "/", "-", "\\"][(t * 8.0) as usize % 4];
                     let (dot, color) = match status {
+                        Status::Queued => ("…", MUTED),
                         Status::Active => (spin, MINT),
                         Status::Connecting => (spin, AMBER),
                         Status::Paused => ("⏸", AMBER),
@@ -590,6 +730,12 @@ impl App {
                     ui.add(egui::Label::new(RichText::new(&name).color(TEXT).strong()).truncate());
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                         match &status {
+                            // in coda: si può solo togliere dalla fila
+                            Status::Queued => {
+                                if tbtn(ui, "[ abort ]", RED) {
+                                    dl.cancel.store(true, Ordering::Relaxed);
+                                }
+                            }
                             Status::Active | Status::Connecting => {
                                 if tbtn(ui, "[ abort ]", RED) {
                                     dl.cancel.store(true, Ordering::Relaxed);
@@ -649,6 +795,10 @@ impl App {
 
                 let pct = if total > 0 { format!("{:>3.0}%  ", done as f64 / total as f64 * 100.0) } else { String::new() };
                 let info = match &status {
+                    Status::Queued => match dl.queue_pos.load(Ordering::Relaxed) {
+                        0 => "in coda — il prossimo".to_string(),
+                        n => format!("in coda — {n} davanti"),
+                    },
                     Status::Connecting => "connessione...".to_string(),
                     Status::Active => {
                         let conns = dl.conc.load(Ordering::Relaxed);
@@ -672,6 +822,7 @@ impl App {
                     Status::Cancelled => "annullato".to_string(),
                 };
                 let info_color = match &status {
+                    Status::Queued => CHROME,
                     Status::Failed(_) => RED,
                     Status::Paused => AMBER,
                     Status::Done => MINT,
@@ -684,6 +835,7 @@ impl App {
         if matches!(status, Status::Done) && self.celebrated.insert(dl.id) {
             let t = ui.input(|i| i.time);
             self.spawn_confetti(row.response.rect, t);
+            self.history = crate::history::load(); // la voce appena scritta
         }
     }
 }

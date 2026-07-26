@@ -27,6 +27,8 @@ struct Behavior {
     truncate: AtomicU64,
     /// richieste servite (la prima è sempre il probe dell'engine)
     hits: AtomicU64,
+    /// se > 0, ogni richiesta risponde con questo status invece del file
+    reject_with: AtomicU64,
 }
 
 struct Server {
@@ -89,6 +91,16 @@ async fn serve(mut sock: tokio::net::TcpStream, body: Arc<Vec<u8>>, bh: Arc<Beha
     };
 
     bh.hits.fetch_add(1, Ordering::SeqCst);
+
+    // rifiuto secco (404, 403, ...) a comando
+    let reject = bh.reject_with.load(Ordering::SeqCst);
+    if reject > 0 {
+        sock.write_all(
+            format!("HTTP/1.1 {reject} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
+        )
+        .await?;
+        return Ok(());
+    }
 
     // 429 a comando
     if bh.rate_limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
@@ -364,6 +376,76 @@ async fn file_changed_on_server_fails_instead_of_corrupting() {
     assert!(!dl.path.lock().unwrap().exists(), "non deve esistere un file finale da byte misti");
 }
 
+#[tokio::test(flavor = "multi_thread")]
+async fn queue_caps_how_many_run_at_once() {
+    let body = Arc::new(make_body(BIG));
+    let srv = spawn_server(body.clone(), behavior(true, Some("\"v1\""))).await;
+    let fx = Fixture::new("queue");
+    // un solo download alla volta: gli altri devono restare in coda
+    fx.state.config.edit(|c| c.max_concurrent_downloads = 1);
+    fx.state.apply_config();
+
+    let mut tasks = Vec::new();
+    for i in 0..3 {
+        let job = fx.job(&format!("{}?n={i}", srv.url));
+        tasks.push(tokio::spawn(engine::run_job(fx.state.clone(), job)));
+    }
+
+    // mentre girano, non deve mai esserci più di un download attivo
+    let mut saw_queued = false;
+    for _ in 0..400 {
+        let (active, queued) = {
+            let dls = fx.state.downloads.lock().unwrap();
+            let a = dls
+                .iter()
+                .filter(|d| matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting))
+                .count();
+            let q = dls.iter().filter(|d| matches!(*d.status.lock().unwrap(), Status::Queued)).count();
+            (a, q)
+        };
+        assert!(active <= 1, "limite a 1 ma {active} download attivi insieme");
+        saw_queued |= queued > 0;
+        if tasks.iter().all(|t| t.is_finished()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    assert!(saw_queued, "con 3 job e limite 1 qualcuno doveva aspettare in coda");
+    let dls = fx.state.downloads.lock().unwrap().clone();
+    assert_eq!(dls.len(), 3);
+    for d in &dls {
+        assert!(matches!(*d.status.lock().unwrap(), Status::Done), "tutti devono comunque completare");
+        assert_eq!(std::fs::read(d.path.lock().unwrap().clone()).unwrap(), *srv.body);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn dead_link_fails_once_without_retrying() {
+    let body = Arc::new(make_body(1024));
+    let bh = behavior(true, None);
+    bh.reject_with.store(404, Ordering::SeqCst);
+    let srv = spawn_server(body, bh.clone()).await;
+    let fx = Fixture::new("404");
+    fx.state.config.edit(|c| c.auto_retry = 3);
+
+    let start = std::time::Instant::now();
+    engine::run_job(fx.state.clone(), fx.job(&srv.url)).await;
+
+    let dl = fx.only_download();
+    match &*dl.status.lock().unwrap() {
+        Status::Failed(e) => assert!(e.contains("404"), "messaggio senza lo status: {e}"),
+        other => panic!("doveva fallire, invece: {}", label(other)),
+    }
+    // il punto: un link morto non deve consumare i retry (5s + 15s + 45s)
+    assert_eq!(dl.retries.load(Ordering::Relaxed), 0, "un 404 non va ritentato");
+    assert!(start.elapsed() < std::time::Duration::from_secs(3), "ha aspettato un backoff inutile");
+    assert!(bh.hits.load(Ordering::SeqCst) <= 3, "troppe richieste per un link morto");
+}
+
 async fn wait_for_progress(state: &Arc<AppState>, bytes: u64) -> Arc<engine::Download> {
     for _ in 0..2000 {
         if let Some(dl) = state.downloads.lock().unwrap().first().cloned() {
@@ -378,6 +460,7 @@ async fn wait_for_progress(state: &Arc<AppState>, bytes: u64) -> Arc<engine::Dow
 
 fn label(s: &Status) -> String {
     match s {
+        Status::Queued => "queued".into(),
         Status::Connecting => "connecting".into(),
         Status::Active => "active".into(),
         Status::Paused => "paused".into(),
