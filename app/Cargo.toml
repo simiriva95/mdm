@@ -26,6 +26,7 @@ ico = "0.4"
 winresource = "0.1"
 
 [target.'cfg(windows)'.dependencies]
+notify-rust = "4"
 tray-icon = "0.19"
 winreg = "0.52"
 raw-window-handle = "0.6"

@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <title>MDM — opzioni</title>
+  <style>
+    body {
+      font: 13px ui-monospace, Consolas, monospace;
+      background: #b4bfd8;
+      color: #2c314a;
+      margin: 0;
+      padding: 24px;
+    }
+    .panel {
+      max-width: 560px;
+      background: #2a2e48;
+      color: #d9ddec;
+      border: 1px solid #23263c;
+      border-radius: 4px;
+      padding: 16px;
+    }
+    h1 { font-size: 14px; margin: 0 0 4px; color: #e8a0a8; font-weight: bold; }
+    .chrome { color: #8d94b8; }
+    hr { border: none; border-top: 1px solid #454b70; margin: 10px 0 16px; }
+    label { display: block; margin: 14px 0 4px; font-weight: bold; }
+    .hint { color: #8d94b8; font-size: 11px; margin-top: 3px; }
+    input, textarea {
+      width: 100%;
+      box-sizing: border-box;
+      background: #1a1c2e;
+      color: #d9ddec;
+      border: 1px solid #454b70;
+      border-radius: 2px;
+      padding: 6px;
+      font: inherit;
+    }
+    textarea { height: 84px; resize: vertical; }
+    .row { display: flex; align-items: center; gap: 8px; margin-top: 14px; }
+    .row input[type=checkbox] { width: auto; }
+    button {
+      margin-top: 18px;
+      background: #1a1c2e;
+      color: #9de3c2;
+      border: 1px solid #454b70;
+      border-radius: 2px;
+      padding: 6px 14px;
+      font: inherit;
+      cursor: pointer;
+    }
+    button:hover { background: #454b70; }
+    #saved { color: #9de3c2; margin-left: 10px; font-size: 11px; }
+  </style>
+</head>
+<body>
+  <div class="panel">
+    <h1><span class="chrome">[</span>X<span class="chrome">][</span>+<span class="chrome">][</span>_<span class="chrome">]</span> MDM — opzioni</h1>
+    <hr>
+
+    <div class="row">
+      <input type="checkbox" id="enabled">
+      <label for="enabled" style="margin:0">intercetta i download</label>
+    </div>
+    <div class="hint">stesso interruttore del click sull'icona</div>
+
+    <label for="threshold">soglia (MB)</label>
+    <input type="number" id="threshold" min="1" step="1">
+    <div class="hint">
+      i file oltre questa dimensione passano a MDM. Quando l'app è in esecuzione
+      comanda il valore impostato nella sua tab Settings.
+    </div>
+
+    <label for="blocklist">domini da ignorare</label>
+    <textarea id="blocklist" placeholder="esempio.com&#10;intranet.azienda.it"></textarea>
+    <div class="hint">uno per riga: questi restano sempre a Chrome</div>
+
+    <button id="save">[ salva ]</button><span id="saved"></span>
+  </div>
+  <script src="options.js"></script>
+</body>
+</html>

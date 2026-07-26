@@ -1,6 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use mdm::{config, engine, host, server, ui, update};
+use mdm::{config, engine, host, notify, server, ui, update};
 
 use std::sync::Arc;
 
@@ -22,6 +22,10 @@ fn main() {
     *state.rt.lock().unwrap() = Some(rt.handle().clone());
     if let Some(p) = engine::system_proxy() {
         state.log(format!("proxy di sistema: {p}"));
+    }
+    // senza AUMID registrato i toast comparirebbero attribuiti a PowerShell
+    if let Err(e) = notify::register() {
+        state.log(format!("notifiche non registrate: {e:#}"));
     }
     engine::scan_resumable(&state);
     server::start(&rt, listener, state.clone());

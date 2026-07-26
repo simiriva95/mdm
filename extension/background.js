@@ -15,10 +15,37 @@ function refreshConfig() {
   });
 }
 
-chrome.storage.local.get({ sizeThreshold: null }, (v) => {
+let blocklist = [];
+
+chrome.storage.local.get({ sizeThreshold: null, blocklist: [] }, (v) => {
   if (v.sizeThreshold > 0) sizeThreshold = v.sizeThreshold;
+  blocklist = v.blocklist || [];
   refreshConfig();
 });
+
+// la pagina opzioni scrive in storage: recepiamo senza aspettare il riavvio
+chrome.storage.onChanged.addListener((changes, area) => {
+  if (area !== 'local') return;
+  if (changes.blocklist) blocklist = changes.blocklist.newValue || [];
+  if (changes.sizeThreshold && changes.sizeThreshold.newValue > 0) {
+    sizeThreshold = changes.sizeThreshold.newValue;
+  }
+  if (changes.enabled) {
+    enabled = changes.enabled.newValue;
+    updateBadge();
+  }
+});
+
+function isBlocked(url) {
+  if (!blocklist.length) return false;
+  let host;
+  try {
+    host = new URL(url).hostname.toLowerCase();
+  } catch {
+    return false;
+  }
+  return blocklist.some((d) => host === d || host.endsWith(`.${d}`));
+}
 const BIG_EXTS = new Set([
   'zip', '7z', 'rar', 'gz', 'bz2', 'xz', 'tar', 'iso', 'img', 'bin',
   'exe', 'msi', 'dmg', 'pkg', 'deb', 'rpm', 'appimage',
@@ -91,6 +118,7 @@ function shouldIntercept(item) {
   const url = item.finalUrl || item.url;
   if (!/^https?:/i.test(url)) return false; // blob:, data:, file: restano in Chrome
   if (wasHandedBack(url)) return false; // è il nostro fallback: lascialo a Chrome
+  if (isBlocked(url)) return false;
   if (item.totalBytes >= sizeThreshold) return true;
   // dimensione ignota: decide l'estensione del file
   if (item.totalBytes <= 0) {
@@ -107,6 +135,22 @@ chrome.downloads.onDeterminingFilename.addListener((item) => {
     chrome.downloads.erase({ id: item.id });
   });
   handOff(item);
+});
+
+// "Scarica con MDM" sui link: bypassa soglia e blocklist, l'utente l'ha chiesto
+chrome.runtime.onInstalled.addListener(() => {
+  chrome.contextMenus.create({
+    id: 'mdm-download',
+    title: 'Scarica con MDM',
+    contexts: ['link', 'video', 'audio', 'image'],
+  });
+});
+
+chrome.contextMenus.onClicked.addListener((info, tab) => {
+  if (info.menuItemId !== 'mdm-download') return;
+  const url = info.linkUrl || info.srcUrl;
+  if (!url || !/^https?:/i.test(url)) return;
+  handOff({ finalUrl: url, filename: '', referrer: (tab && tab.url) || info.pageUrl || '' });
 });
 
 async function handOff(item) {

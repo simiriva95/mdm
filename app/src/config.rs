@@ -107,12 +107,18 @@ impl Default for Store {
 
 impl Store {
     pub fn load() -> Arc<Self> {
-        let mut cfg = std::fs::read(path())
-            .ok()
-            .and_then(|raw| serde_json::from_slice::<Config>(&raw).ok())
-            .unwrap_or_default();
+        let existing = std::fs::read(path()).ok().and_then(|raw| serde_json::from_slice::<Config>(&raw).ok());
+        let missing = existing.is_none();
+        let mut cfg = existing.unwrap_or_default();
         cfg.clamp();
-        Arc::new(Self { inner: Mutex::new(cfg), dirty: Mutex::new(None), saving: AtomicBool::new(false) })
+        let store =
+            Arc::new(Self { inner: Mutex::new(cfg), dirty: Mutex::new(None), saving: AtomicBool::new(false) });
+        // primo avvio: scrivi subito i default, così il file esiste ed è
+        // ispezionabile senza dover prima toccare qualcosa nella UI
+        if missing {
+            store.save_now();
+        }
+        store
     }
 
     pub fn get(&self) -> Config {

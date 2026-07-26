@@ -506,7 +506,20 @@ fn finish(state: &AppState, dl: &Arc<Download>, result: anyhow::Result<PathBuf>)
         }
     }
     let terminal = !matches!(*status, Status::Paused);
+    // notifica solo sugli esiti che l'utente vuole sapere: un annullamento
+    // l'ha chiesto lui, una pausa non è la fine di niente
+    let notify = match &*status {
+        Status::Done => Some(String::new()),
+        Status::Failed(e) if dl.fatal.load(Ordering::Relaxed) => Some(e.clone()),
+        _ => None,
+    };
     drop(status);
+
+    if let Some(detail) = notify {
+        if state.config.get().notify_on_complete {
+            crate::notify::finished(&dl.name.lock().unwrap(), ok, &detail);
+        }
+    }
 
     // cronologia: solo esiti definitivi, una pausa non è la fine di niente
     if terminal {

@@ -146,8 +146,10 @@ struct App {
     /// cronologia caricata da disco, ricaricata quando cambia qualcosa
     history: Vec<crate::history::Entry>,
     show_history: bool,
+    /// ultimo titolo impostato, per non spammare il comando alla viewport
+    last_title: String,
     #[cfg(windows)]
-    _tray: Option<Tray>,
+    tray: Option<Tray>,
     quitting: bool,
 }
 
@@ -168,8 +170,9 @@ impl App {
             last_clip_check: Instant::now(),
             history: crate::history::load(),
             show_history: false,
+            last_title: "MDM".to_string(),
             #[cfg(windows)]
-            _tray: Tray::build(state),
+            tray: Tray::build(state),
             quitting: false,
         }
     }
@@ -374,10 +377,19 @@ impl eframe::App for App {
             self.enqueue_url(&text);
         }
 
+        #[cfg(windows)]
+        if let Some(tray) = self.tray.as_mut() {
+            tray.update_tooltip(n_active, total_speed);
+        }
+        self.update_title(ctx, &downloads, n_active, total_speed);
+
         self.paint_confetti(ctx, ctx.input(|i| i.time));
 
-        // 15fps: bastano per topolino, orologio e progressi
-        ctx.request_repaint_after(Duration::from_millis(66));
+        // 15fps quando c'è qualcosa da guardare (progressi, animazioni, mouse
+        // dentro la finestra), 2fps da fermi: prima ridipingeva per sempre a
+        // 15fps anche a zero download, bruciando CPU e batteria per niente.
+        let busy = n_active > 0 || !self.confetti.is_empty() || ctx.input(|i| i.pointer.has_pointer());
+        ctx.request_repaint_after(Duration::from_millis(if busy { 66 } else { 500 }));
     }
 }
 
@@ -483,6 +495,31 @@ impl App {
             });
             sparkline(ui, &self.net_history, 46.0);
         });
+    }
+
+    /// Percentuale e velocità nel titolo: Windows le mostra nell'anteprima
+    /// della taskbar e in Alt-Tab, quindi il progresso si legge anche con la
+    /// finestra coperta. Aggiornato solo quando cambia, non a ogni frame.
+    fn update_title(&mut self, ctx: &egui::Context, downloads: &[Arc<Download>], n_active: usize, speed: f64) {
+        let title = if n_active == 0 {
+            "MDM".to_string()
+        } else {
+            let (done, total) = downloads
+                .iter()
+                .filter(|d| matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting))
+                .fold((0u64, 0u64), |(d0, t0), d| {
+                    (d0 + d.done.load(Ordering::Relaxed), t0 + d.total.load(Ordering::Relaxed))
+                });
+            if total > 0 {
+                format!("MDM — {:.0}% · {}/s", done as f64 / total as f64 * 100.0, fmt_bytes(speed as u64))
+            } else {
+                format!("MDM — {}/s", fmt_bytes(speed as u64))
+            }
+        };
+        if title != self.last_title {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
+            self.last_title = title;
+        }
     }
 
     /// Se negli appunti compare il link a un file scaricabile, lo propone nel
@@ -1176,26 +1213,68 @@ fn reveal(path: &std::path::Path) {
 
 #[cfg(windows)]
 struct Tray {
-    _icon: tray_icon::TrayIcon,
+    icon: tray_icon::TrayIcon,
+    last_tip: String,
 }
 
 #[cfg(windows)]
 impl Tray {
+    /// Tooltip vivo: dall'icona si legge cosa sta succedendo senza aprire
+    /// la finestra. Aggiornato solo quando il testo cambia davvero.
+    fn update_tooltip(&mut self, n_active: usize, speed: f64) {
+        let tip = if n_active > 0 {
+            format!("MDM — {n_active} attivi, {}/s", fmt_bytes(speed as u64))
+        } else {
+            "MDM — nessun download".to_string()
+        };
+        if tip != self.last_tip {
+            let _ = self.icon.set_tooltip(Some(&tip));
+            self.last_tip = tip;
+        }
+    }
+
     fn build(state: Arc<AppState>) -> Option<Self> {
-        use tray_icon::menu::{Menu, MenuEvent, MenuItem};
+        use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
         use tray_icon::{MouseButton, MouseButtonState, TrayIconEvent};
 
         let open = MenuItem::new("Apri", true, None);
+        let pause = MenuItem::new("Pausa tutti", true, None);
+        let resume = MenuItem::new("Riprendi tutti", true, None);
         let quit = MenuItem::new("Esci", true, None);
         let menu = Menu::new();
-        menu.append_items(&[&open, &quit]).ok()?;
+        menu.append_items(&[&open, &PredefinedMenuItem::separator(), &pause, &resume, &PredefinedMenuItem::separator(), &quit])
+            .ok()?;
         let open_id = open.id().clone();
+        let pause_id = pause.id().clone();
+        let resume_id = resume.id().clone();
         let quit_id = quit.id().clone();
 
         let st = state.clone();
         MenuEvent::set_event_handler(Some(move |ev: MenuEvent| {
             if ev.id == open_id {
                 st.wake_and_show();
+            } else if ev.id == pause_id {
+                for d in st.downloads.lock().unwrap().iter() {
+                    if matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting) {
+                        d.pause.store(true, Ordering::Relaxed);
+                    }
+                }
+                st.repaint();
+            } else if ev.id == resume_id {
+                let rt = st.rt.lock().unwrap().clone();
+                if let Some(rt) = rt {
+                    let paused: Vec<_> = st
+                        .downloads
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .filter(|d| matches!(*d.status.lock().unwrap(), Status::Paused | Status::Failed(_)))
+                        .cloned()
+                        .collect();
+                    for d in paused {
+                        rt.spawn(engine::resume(st.clone(), d));
+                    }
+                }
             } else if ev.id == quit_id {
                 st.quit.store(true, Ordering::Relaxed);
                 st.wake_and_show(); // il loop deve girare per processare Close
@@ -1217,7 +1296,7 @@ impl Tray {
             .with_icon(icon)
             .build()
             .ok()?;
-        Some(Self { _icon: tray })
+        Some(Self { icon: tray, last_tip: String::new() })
     }
 }
 
