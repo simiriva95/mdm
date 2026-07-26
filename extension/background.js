@@ -1,5 +1,24 @@
 const HOST = 'com.sriva.downloader';
-const SIZE_THRESHOLD = 10 * 1024 * 1024; // 10 MB
+// soglia di default; l'app è l'autorità e la sovrascrive appena risponde
+let sizeThreshold = 10 * 1024 * 1024;
+
+/// Chiede la soglia all'app. Se l'app è spenta non la avvia: si tiene l'ultimo
+/// valore noto (persistito, così sopravvive al riciclo del service worker).
+function refreshConfig() {
+  chrome.runtime.sendNativeMessage(HOST, { cmd: 'config' }, (resp) => {
+    void chrome.runtime.lastError; // app spenta: normale, si riprova dopo
+    const mb = resp && resp.ok && Number(resp.sizeThresholdMb);
+    if (mb > 0) {
+      sizeThreshold = mb * 1024 * 1024;
+      chrome.storage.local.set({ sizeThreshold });
+    }
+  });
+}
+
+chrome.storage.local.get({ sizeThreshold: null }, (v) => {
+  if (v.sizeThreshold > 0) sizeThreshold = v.sizeThreshold;
+  refreshConfig();
+});
 const BIG_EXTS = new Set([
   'zip', '7z', 'rar', 'gz', 'bz2', 'xz', 'tar', 'iso', 'img', 'bin',
   'exe', 'msi', 'dmg', 'pkg', 'deb', 'rpm', 'appimage',
@@ -72,7 +91,7 @@ function shouldIntercept(item) {
   const url = item.finalUrl || item.url;
   if (!/^https?:/i.test(url)) return false; // blob:, data:, file: restano in Chrome
   if (wasHandedBack(url)) return false; // è il nostro fallback: lascialo a Chrome
-  if (item.totalBytes >= SIZE_THRESHOLD) return true;
+  if (item.totalBytes >= sizeThreshold) return true;
   // dimensione ignota: decide l'estensione del file
   if (item.totalBytes <= 0) {
     const name = basename(item.filename) || basename(new URL(url).pathname);
@@ -133,4 +152,5 @@ chrome.alarms.onAlarm.addListener((a) => {
     if (now > until) handedBack.delete(url);
   }
   persistHandedBack();
+  refreshConfig(); // la soglia può essere cambiata dalla tab Settings
 });

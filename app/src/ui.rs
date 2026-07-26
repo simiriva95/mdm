@@ -105,6 +105,7 @@ fn apply_theme(ctx: &egui::Context) {
 enum Tab {
     Downloads,
     Console,
+    Settings,
 }
 
 struct SpeedSample {
@@ -135,6 +136,8 @@ struct App {
     last_net_sample: Instant,
     confetti: Vec<Confetti>,
     celebrated: HashSet<u64>, // download già festeggiati
+    /// buffer del campo cartella: la config tiene un PathBuf, la UI una String
+    dir_buf: String,
     #[cfg(windows)]
     _tray: Option<Tray>,
     quitting: bool,
@@ -151,6 +154,7 @@ impl App {
             last_net_sample: Instant::now(),
             confetti: Vec::new(),
             celebrated: HashSet::new(),
+            dir_buf: state.config.get().download_dir.to_string_lossy().into_owned(),
             #[cfg(windows)]
             _tray: Tray::build(state),
             quitting: false,
@@ -286,6 +290,9 @@ impl eframe::App for App {
                 if desk_tag(ui, "[ Console ]", self.tab == Tab::Console) {
                     self.tab = Tab::Console;
                 }
+                if desk_tag(ui, "[ Settings ]", self.tab == Tab::Settings) {
+                    self.tab = Tab::Settings;
+                }
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.add_space(2.0);
                     let (dot, txt) = if n_active > 0 {
@@ -329,9 +336,14 @@ impl eframe::App for App {
         egui::CentralPanel::default().frame(egui::Frame::none().fill(DESK).inner_margin(6.0)).show(ctx, |ui| {
             match self.tab {
                 Tab::Console => self.console_tab(ui),
+                Tab::Settings => self.settings_tab(ui),
                 Tab::Downloads => self.downloads_tab(ui, &downloads, n_active, total_speed),
             }
         });
+
+        // salvataggio pigro della config: gli slider muovono i valori a ogni
+        // frame, il write su disco avviene solo quando si smette di toccarli
+        self.state.config.flush_due();
 
         self.paint_confetti(ctx, ctx.input(|i| i.time));
 
@@ -423,6 +435,90 @@ impl App {
             });
             sparkline(ui, &self.net_history, 46.0);
         });
+    }
+
+    /// Impostazioni: stessa estetica delle altre finestre, una riga per voce.
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        let h = ui.available_height();
+        let mut cfg = self.state.config.get();
+        let before = cfg.clone();
+
+        ui.allocate_ui(vec2(ui.available_width(), h), |ui| {
+            term_window(ui, "settings", AMBER, |ui| {
+                ui.set_min_height(h - 50.0);
+                egui::ScrollArea::vertical().id_salt("settings_scroll").show(ui, |ui| {
+                    setting_row(ui, "cartella", "vuoto = cartella Downloads di sistema", |ui| {
+                        ui.add(egui::TextEdit::singleline(&mut self.dir_buf).desired_width(320.0).hint_text("Downloads"));
+                        if tbtn(ui, "[ apri ]", BLUE) {
+                            if let Ok(d) = self.state.dl_dir() {
+                                reveal(&d.join("."));
+                            }
+                        }
+                    });
+                    cfg.download_dir = std::path::PathBuf::from(self.dir_buf.trim());
+
+                    setting_row(ui, "connessioni", "per download; troppe fanno scattare i 429", |ui| {
+                        ui.add(egui::Slider::new(&mut cfg.max_connections, 1..=engine::MAX_CONNECTIONS).integer());
+                    });
+
+                    setting_row(ui, "download insieme", "gli altri restano in coda", |ui| {
+                        ui.add(egui::Slider::new(&mut cfg.max_concurrent_downloads, 1..=10).integer());
+                    });
+
+                    setting_row(ui, "limite banda", "KB/s totali, 0 = illimitato", |ui| {
+                        ui.add(egui::Slider::new(&mut cfg.speed_limit_kbps, 0..=100_000).integer().logarithmic(true));
+                    });
+
+                    setting_row(ui, "soglia estensione", "MB oltre cui Chrome passa il download a MDM", |ui| {
+                        ui.add(egui::Slider::new(&mut cfg.size_threshold_mb, 1..=1000).integer().logarithmic(true));
+                    });
+
+                    setting_row(ui, "retry automatici", "quante volte ritentare da solo dopo un errore", |ui| {
+                        ui.add(egui::Slider::new(&mut cfg.auto_retry, 0..=10).integer());
+                    });
+
+                    setting_row(ui, "notifiche", "avviso di sistema a download finito", |ui| {
+                        ui.checkbox(&mut cfg.notify_on_complete, "");
+                    });
+
+                    setting_row(ui, "guarda appunti", "proponi il download se copi un link a un file", |ui| {
+                        ui.checkbox(&mut cfg.clipboard_watch, "");
+                    });
+
+                    #[cfg(windows)]
+                    setting_row(ui, "avvio automatico", "parte con Windows, minimizzato nel tray", |ui| {
+                        if ui.checkbox(&mut cfg.autostart, "").changed() {
+                            if let Err(e) = crate::config::set_autostart(cfg.autostart) {
+                                self.state.log(format!("ERRORE autostart: {e:#}"));
+                            }
+                        }
+                    });
+
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new(format!("config: {}", crate::config::path().display()))
+                            .color(CHROME)
+                            .size(10.0),
+                    );
+                    if !cfg.host_conc.is_empty() {
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{} host rate-limitati ricordati", cfg.host_conc.len()))
+                                    .color(CHROME)
+                                    .size(10.0),
+                            );
+                            if tbtn(ui, "[ dimentica ]", MUTED) {
+                                cfg.host_conc.clear();
+                            }
+                        });
+                    }
+                });
+            });
+        });
+
+        if cfg != before {
+            self.state.config.edit(move |c| *c = cfg);
+        }
     }
 
     fn console_tab(&mut self, ui: &mut egui::Ui) {
@@ -709,6 +805,21 @@ fn desk_tag(ui: &mut egui::Ui, text: &str, active: bool) -> bool {
             .rounding(Rounding::same(2.0)),
     )
     .clicked()
+}
+
+/// Riga di impostazione: etichetta a sinistra, widget a destra, nota sotto.
+fn setting_row(ui: &mut egui::Ui, label: &str, hint: &str, add: impl FnOnce(&mut egui::Ui)) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.allocate_ui(vec2(150.0, 18.0), |ui| {
+            ui.label(RichText::new(label).color(TEXT).strong());
+        });
+        add(ui);
+    });
+    ui.horizontal(|ui| {
+        ui.add_space(150.0);
+        ui.label(RichText::new(hint).color(CHROME).size(10.0));
+    });
 }
 
 fn tbtn(ui: &mut egui::Ui, label: &str, color: Color32) -> bool {

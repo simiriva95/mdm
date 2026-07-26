@@ -13,7 +13,9 @@ use reqwest::header::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
-const MAX_SEGMENTS: u64 = 8;
+/// Tetto assoluto delle connessioni: la config non può superarlo.
+pub const MAX_CONNECTIONS: u64 = crate::config::MAX_CONNECTIONS_CAP;
+const MAX_SEGMENTS: u64 = MAX_CONNECTIONS;
 const MIN_SEGMENT: u64 = 4 * 1024 * 1024;
 const SEGMENT_RETRIES: u32 = 8; // consecutivi senza alcun progresso
 const SIDECAR_EVERY: std::time::Duration = std::time::Duration::from_secs(2);
@@ -177,10 +179,8 @@ pub struct AppState {
     pub hwnd: std::sync::atomic::AtomicIsize,
     pub egui_ctx: Mutex<Option<eframe::egui::Context>>,
     pub rt: Mutex<Option<tokio::runtime::Handle>>,
-    /// memoria per host (solo sessione): quante connessioni ha tollerato l'ultima volta
-    pub host_conc: Mutex<std::collections::HashMap<String, u64>>,
-    /// cartella di destinazione; vuota = cartella Downloads di sistema
-    pub download_dir: Mutex<PathBuf>,
+    /// impostazioni persistite: cartella, connessioni, banda, memoria per host
+    pub config: Arc<crate::config::Store>,
     next_id: AtomicU64,
 }
 
@@ -213,14 +213,25 @@ fn append_log_file(line: &str) {
 }
 
 impl AppState {
-    /// Dove finiscono i file. Override esplicito, altrimenti Downloads di sistema.
+    /// Stato con una config già caricata (il binario); `default()` ne usa una
+    /// in memoria, così i test non leggono né sporcano quella dell'utente.
+    pub fn with_config(config: Arc<crate::config::Store>) -> Self {
+        Self { config, ..Default::default() }
+    }
+
+    /// Dove finiscono i file. Override da config, altrimenti Downloads di sistema.
     pub fn dl_dir(&self) -> anyhow::Result<PathBuf> {
-        let dir = self.download_dir.lock().unwrap().clone();
+        let dir = self.config.get().download_dir;
         if !dir.as_os_str().is_empty() {
             std::fs::create_dir_all(&dir).with_context(|| format!("creazione di {}", dir.display()))?;
             return Ok(dir);
         }
         dirs::download_dir().context("cartella Downloads non trovata")
+    }
+
+    /// Connessioni parallele massime per download.
+    pub fn max_conc(&self) -> u64 {
+        self.config.get().max_connections
     }
 
     pub fn log(&self, line: impl Into<String>) {
@@ -273,7 +284,7 @@ impl AppState {
             total: AtomicU64::new(0),
             done: AtomicU64::new(0),
             segs: Mutex::new(Vec::new()),
-            conc: AtomicU64::new(MAX_SEGMENTS),
+            conc: AtomicU64::new(self.max_conc()),
             resumable: AtomicBool::new(false),
             status: Mutex::new(Status::Connecting),
             cancel: AtomicBool::new(false),
@@ -340,7 +351,9 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
         *dl.status.lock().unwrap() = Status::Active;
         state.repaint();
         let (client, headers) = build_client(&job);
-        let r = run_segments(&client, &job.url, &headers, &part, &dl, remembered_conc(&state, &job.url)).await;
+        let r =
+            run_segments(&client, &job.url, &headers, &part, &dl, remembered_conc(&state, &job.url), state.max_conc())
+                .await;
         remember_conc(&state, &job.url, &dl);
         match r {
             Ok(()) => finalize(&dl, &part).await,
@@ -523,13 +536,14 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
     if segmented {
         let len = len.unwrap();
         drop(probe);
-        let segs: Vec<Arc<Seg>> = split_segments(len, MAX_SEGMENTS, MIN_SEGMENT)
+        let max_conc = state.max_conc();
+        let segs: Vec<Arc<Seg>> = split_segments(len, max_conc, MIN_SEGMENT)
             .into_iter()
             .map(|(start, end)| Seg::new(start, end, 0))
             .collect();
         // se questo host ha già protestato (429), riparti prudente
         let start_conc = remembered_conc(state, &job.url);
-        if start_conc < MAX_SEGMENTS {
+        if start_conc < max_conc {
             state.log(format!("{} segmenti, parto con {start_conc} connessioni (host già rate-limitato)", segs.len()));
         } else {
             state.log(format!("{} segmenti paralleli, {}", segs.len(), crate::ui::fmt_bytes(len)));
@@ -538,7 +552,7 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
         let f = tokio::fs::File::create(&part).await?;
         f.set_len(len).await?; // pre-alloca
         drop(f);
-        let r = run_segments(&client, &job.url, &headers, &part, dl, start_conc).await;
+        let r = run_segments(&client, &job.url, &headers, &part, dl, start_conc, max_conc).await;
         remember_conc(state, &job.url, dl);
         r?;
     } else {
@@ -639,15 +653,19 @@ fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
 /// (Un semaforo non basta: coi permessi tutti occupati non c'è nulla da togliere.)
 struct Gate {
     max: AtomicU64,
+    /// tetto configurato: la risalita non lo supera mai
+    cap: u64,
     active: AtomicU64,
     notify: tokio::sync::Notify,
     last_shrink: Mutex<std::time::Instant>,
 }
 
 impl Gate {
-    fn new(max: u64) -> Self {
+    fn new(max: u64, cap: u64) -> Self {
+        let cap = cap.clamp(1, MAX_SEGMENTS);
         Self {
-            max: AtomicU64::new(max.max(1)),
+            max: AtomicU64::new(max.clamp(1, cap)),
+            cap,
             active: AtomicU64::new(0),
             notify: tokio::sync::Notify::new(),
             last_shrink: Mutex::new(std::time::Instant::now()),
@@ -691,7 +709,7 @@ impl Gate {
             return None;
         }
         let m = self.max.load(Ordering::SeqCst);
-        if m >= MAX_SEGMENTS {
+        if m >= self.cap {
             return None;
         }
         self.max.store(m + 1, Ordering::SeqCst);
@@ -733,6 +751,7 @@ async fn run_segments(
     part: &Path,
     dl: &Arc<Download>,
     start_conc: u64,
+    max_conc: u64,
 ) -> anyhow::Result<()> {
     let total = dl.total.load(Ordering::Relaxed);
     // resume: assicura che il .part abbia la dimensione giusta
@@ -742,8 +761,8 @@ async fn run_segments(
     }
     let _ = write_sidecar(dl, part);
 
-    let gate = Arc::new(Gate::new(start_conc));
-    dl.conc.store(start_conc.max(1), Ordering::Relaxed);
+    let gate = Arc::new(Gate::new(start_conc, max_conc));
+    dl.conc.store(gate.max.load(Ordering::SeqCst), Ordering::Relaxed);
 
     // coda dei segmenti da fare; quando è vuota i worker rubano lavoro
     // dimezzando il segmento più indietro (stile FDM: nessuna connessione ferma)
@@ -752,7 +771,7 @@ async fn run_segments(
     ));
 
     let mut tasks = Vec::new();
-    for _ in 0..MAX_SEGMENTS {
+    for _ in 0..gate.cap {
         let client = client.clone();
         let url = url.to_string();
         let headers = headers.clone();
@@ -1070,15 +1089,24 @@ fn host_of(url: &str) -> String {
     url.split("://").nth(1).unwrap_or(url).split(['/', '?', '#']).next().unwrap_or("").to_string()
 }
 
+/// Quante connessioni ha tollerato questo host l'ultima volta. La memoria è
+/// nella config, quindi sopravvive al riavvio: un host che rate-limita non va
+/// ri-martellato a 8 connessioni ogni volta che si apre l'app.
 fn remembered_conc(state: &AppState, url: &str) -> u64 {
-    state.host_conc.lock().unwrap().get(&host_of(url)).copied().unwrap_or(MAX_SEGMENTS)
+    let cfg = state.config.get();
+    cfg.host_conc.get(&host_of(url)).copied().unwrap_or(cfg.max_connections).min(cfg.max_connections)
 }
 
 fn remember_conc(state: &AppState, url: &str, dl: &Download) {
     let conc = dl.conc.load(Ordering::Relaxed);
-    if conc < MAX_SEGMENTS {
-        state.host_conc.lock().unwrap().insert(host_of(url), conc);
-    }
+    let host = host_of(url);
+    state.config.edit(|c| {
+        if conc < c.max_connections {
+            c.host_conc.insert(host, conc);
+        } else {
+            c.host_conc.remove(&host); // l'host regge di nuovo il massimo
+        }
+    });
 }
 
 fn sidecar_path(part: &Path) -> PathBuf {
@@ -1299,7 +1327,7 @@ mod tests {
 
     #[tokio::test]
     async fn gate_aimd() {
-        let g = Gate::new(8);
+        let g = Gate::new(8, 8);
         assert_eq!(g.shrink(), 4);
         assert_eq!(g.shrink(), 2);
         assert_eq!(g.shrink(), 1);
@@ -1315,7 +1343,7 @@ mod tests {
 
     #[test]
     fn gate_grow() {
-        let g = Gate::new(8);
+        let g = Gate::new(8, 8);
         assert_eq!(g.shrink(), 4);
         // quiet non ancora passato: niente salita
         assert_eq!(g.maybe_grow(std::time::Duration::from_secs(3600)), None);
@@ -1323,7 +1351,17 @@ mod tests {
         assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(6));
         assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(7));
         assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(8));
-        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), None); // mai sopra MAX_SEGMENTS
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), None); // mai sopra il cap
+    }
+
+    #[test]
+    fn gate_respects_configured_cap() {
+        // con max_connections=2 in config la risalita si ferma a 2
+        let g = Gate::new(8, 2);
+        assert_eq!(g.max.load(Ordering::SeqCst), 2, "lo start viene clampato al cap");
+        assert_eq!(g.shrink(), 1);
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), Some(2));
+        assert_eq!(g.maybe_grow(std::time::Duration::ZERO), None);
     }
 
     #[test]

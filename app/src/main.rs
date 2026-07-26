@@ -1,6 +1,6 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
-use mdm::{engine, host, server, ui, update};
+use mdm::{config, engine, host, server, ui, update};
 
 use std::sync::Arc;
 
@@ -17,7 +17,7 @@ fn main() {
         Err(_) => return,
     };
 
-    let state = Arc::new(engine::AppState::default());
+    let state = Arc::new(engine::AppState::with_config(config::Store::load()));
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     *state.rt.lock().unwrap() = Some(rt.handle().clone());
     if let Some(p) = engine::system_proxy() {

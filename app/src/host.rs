@@ -25,7 +25,9 @@ pub fn run() {
         }
 
         let reply = match forward(&buf) {
-            Ok(()) => br#"{"ok":true}"#.to_vec(),
+            // la risposta dell'app passa intatta: serve all'estensione per
+            // leggere la config (soglia) oltre al semplice ok/ko
+            Ok(line) => line.into_bytes(),
             Err(e) => format!(r#"{{"ok":false,"error":"{}"}}"#, e.to_string().replace('"', "'")).into_bytes(),
         };
         let mut out = std::io::stdout().lock();
@@ -38,21 +40,27 @@ pub fn run() {
     }
 }
 
-fn forward(job: &[u8]) -> anyhow::Result<()> {
-    let mut stream = connect_or_spawn()?;
+fn forward(job: &[u8]) -> anyhow::Result<String> {
+    // solo un download vero giustifica l'avvio dell'app: le query di
+    // configurazione dell'estensione non devono farla comparire dal nulla
+    let spawn_if_down = serde_json::from_slice::<serde_json::Value>(job)
+        .map(|v| v.get("url").is_some())
+        .unwrap_or(false);
+    let mut stream = connect_or_spawn(spawn_if_down)?;
     stream.write_all(job)?;
     stream.write_all(b"\n")?;
     let mut line = String::new();
     BufReader::new(stream).read_line(&mut line)?;
-    anyhow::ensure!(line.contains("ok"), "risposta app inattesa: {line}");
-    Ok(())
+    anyhow::ensure!(line.contains("\"ok\":true"), "risposta app inattesa: {line}");
+    Ok(line.trim().to_string())
 }
 
-fn connect_or_spawn() -> anyhow::Result<TcpStream> {
+fn connect_or_spawn(spawn_if_down: bool) -> anyhow::Result<TcpStream> {
     let addr = ("127.0.0.1", PORT);
     if let Ok(s) = TcpStream::connect(addr) {
         return Ok(s);
     }
+    anyhow::ensure!(spawn_if_down, "app non in esecuzione");
 
     let exe = std::env::current_exe()?;
     let mut cmd = Command::new(&exe);

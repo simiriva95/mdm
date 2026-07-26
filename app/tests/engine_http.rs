@@ -158,7 +158,7 @@ impl Fixture {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let state = Arc::new(AppState::default());
-        *state.download_dir.lock().unwrap() = dir.clone();
+        state.config.edit(|c| c.download_dir = dir.clone());
         Self { state, dir }
     }
 
@@ -319,7 +319,8 @@ async fn sidecar_restores_download_after_a_crash() {
 
     // nuovo processo: stato vuoto, stessa cartella
     let fresh = Arc::new(AppState::default());
-    *fresh.download_dir.lock().unwrap() = fx.dir.clone();
+    let d = fx.dir.clone();
+    fresh.config.edit(|c| c.download_dir = d);
     engine::scan_resumable(&fresh);
 
     let restored = fresh.downloads.lock().unwrap().first().cloned().expect("nulla ripristinato dal sidecar");

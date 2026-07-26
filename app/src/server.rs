@@ -26,9 +26,9 @@ pub fn start(rt: &tokio::runtime::Runtime, listener: std::net::TcpListener, stat
                     match serde_json::from_value::<Job>(value) {
                         Ok(job) => {
                             tokio::spawn(engine::run_job(state, job));
-                            "{\"ok\":true}\n"
+                            r#"{"ok":true}"#.to_string()
                         }
-                        Err(_) => "{\"ok\":false}\n",
+                        Err(_) => r#"{"ok":false}"#.to_string(),
                     }
                 } else if value.get("cmd").and_then(|c| c.as_str()) == Some("resume_all") {
                     let paused: Vec<_> = state
@@ -44,11 +44,16 @@ pub fn start(rt: &tokio::runtime::Runtime, listener: std::net::TcpListener, stat
                     for dl in paused {
                         tokio::spawn(engine::resume(state.clone(), dl));
                     }
-                    "{\"ok\":true}\n"
+                    r#"{"ok":true}"#.to_string()
+                } else if value.get("cmd").and_then(|c| c.as_str()) == Some("config") {
+                    // l'estensione chiede all'app la soglia: un solo posto dove
+                    // configurarla invece di un numero hardcoded nel background.js
+                    let cfg = state.config.get();
+                    format!(r#"{{"ok":true,"sizeThresholdMb":{}}}"#, cfg.size_threshold_mb)
                 } else {
-                    "{\"ok\":false}\n"
+                    r#"{"ok":false}"#.to_string()
                 };
-                let _ = reader.into_inner().write_all(reply.as_bytes()).await;
+                let _ = reader.into_inner().write_all(format!("{reply}\n").as_bytes()).await;
             });
         }
     });
