@@ -11,6 +11,10 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 dirs = "5"
 eframe = "0.29"
 futures-util = "0.3"
+# NON aggiungere la feature "http2": con HTTP/2 le richieste dei segmenti
+# verrebbero multiplexate su una sola connessione TCP (una sola finestra di
+# congestione), annullando il vantaggio del download segmentato. Verificato:
+# senza questa feature l'ALPN negozia HTTP/1.1 anche con server che parlano h2.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

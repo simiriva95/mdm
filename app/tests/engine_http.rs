@@ -19,6 +19,13 @@ struct Behavior {
     ranges: bool,
     /// validator corrente; cambiandolo si simula il file che muta sul server
     etag: Mutex<Option<String>>,
+    /// se presente, sostituisce `etag` finita la grazia: il file "cambia"
+    /// subito dopo il probe, senza dover cronometrare un task esterno
+    etag_after_grace: Mutex<Option<String>>,
+    /// quante richieste servire normalmente prima di iniziare a rifiutare
+    /// (1 = lascia passare il probe). Evita di dover pilotare il server da un
+    /// task a parte, che era una corsa contro il download.
+    grace: AtomicU64,
     /// quante delle prossime richieste rispondono 429
     rate_limit: AtomicU64,
     /// se il 429 deve portare un Retry-After
@@ -29,6 +36,8 @@ struct Behavior {
     hits: AtomicU64,
     /// se > 0, ogni richiesta risponde con questo status invece del file
     reject_with: AtomicU64,
+    /// connessioni TCP accettate: serve a verificare il riuso del pool
+    conns: AtomicU64,
 }
 
 struct Server {
@@ -60,8 +69,12 @@ async fn spawn_server(body: Arc<Vec<u8>>, behavior: Arc<Behavior>) -> Server {
             let Ok((sock, _)) = listener.accept().await else { continue };
             let b = b.clone();
             let bh = bh.clone();
+            bh.conns.fetch_add(1, Ordering::SeqCst);
             tokio::spawn(async move {
-                let _ = serve(sock, b, bh).await;
+                // keep-alive: piu' richieste sulla stessa connessione, cosi' il
+                // riuso del pool di reqwest e' osservabile
+                let mut sock = sock;
+                while let Ok(true) = serve(&mut sock, b.clone(), bh.clone()).await {}
             });
         }
     });
@@ -69,14 +82,16 @@ async fn spawn_server(body: Arc<Vec<u8>>, behavior: Arc<Behavior>) -> Server {
     Server { url, body }
 }
 
-async fn serve(mut sock: tokio::net::TcpStream, body: Arc<Vec<u8>>, bh: Arc<Behavior>) -> std::io::Result<()> {
+/// Serve una richiesta. `Ok(true)` = la connessione resta aperta per la
+/// prossima (keep-alive), `Ok(false)` = va chiusa.
+async fn serve(sock: &mut tokio::net::TcpStream, body: Arc<Vec<u8>>, bh: Arc<Behavior>) -> std::io::Result<bool> {
     // leggi gli header fino a riga vuota
     let mut raw = Vec::new();
     let mut buf = [0u8; 1024];
     loop {
         let n = sock.read(&mut buf).await?;
         if n == 0 {
-            return Ok(());
+            return Ok(false);
         }
         raw.extend_from_slice(&buf[..n]);
         if raw.windows(4).any(|w| w == b"\r\n\r\n") {
@@ -95,23 +110,24 @@ async fn serve(mut sock: tokio::net::TcpStream, body: Arc<Vec<u8>>, bh: Arc<Beha
     // rifiuto secco (404, 403, ...) a comando
     let reject = bh.reject_with.load(Ordering::SeqCst);
     if reject > 0 {
-        sock.write_all(
-            format!("HTTP/1.1 {reject} Rejected\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").as_bytes(),
-        )
-        .await?;
-        return Ok(());
+        sock.write_all(format!("HTTP/1.1 {reject} Rejected\r\nContent-Length: 0\r\n\r\n").as_bytes()).await?;
+        return Ok(true);
     }
 
-    // 429 a comando
-    if bh.rate_limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
+    // 429 a comando, una volta esaurita la finestra di grazia
+    let in_grace = bh.grace.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    if !in_grace && bh.rate_limit.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok() {
         let extra = if bh.retry_after.load(Ordering::SeqCst) { "Retry-After: 1\r\n" } else { "" };
-        sock.write_all(format!("HTTP/1.1 429 Too Many Requests\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n").as_bytes())
+        sock.write_all(format!("HTTP/1.1 429 Too Many Requests\r\n{extra}Content-Length: 0\r\n\r\n").as_bytes())
             .await?;
-        return Ok(());
+        return Ok(true);
     }
 
     let total = body.len();
-    let etag = bh.etag.lock().unwrap().clone();
+    let etag = match (in_grace, bh.etag_after_grace.lock().unwrap().clone()) {
+        (false, Some(next)) => Some(next),
+        _ => bh.etag.lock().unwrap().clone(),
+    };
     let if_range = header("If-Range");
     // If-Range che non combacia => il server serve il file intero (RFC 9110)
     let stale = if_range.is_some() && if_range != etag;
@@ -122,14 +138,14 @@ async fn serve(mut sock: tokio::net::TcpStream, body: Arc<Vec<u8>>, bh: Arc<Beha
     let (head, slice) = match range {
         Some((s, e)) if bh.ranges && !stale => (
             format!(
-                "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n{etag_line}Content-Range: bytes {s}-{e}/{total}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 206 Partial Content\r\nAccept-Ranges: bytes\r\n{etag_line}Content-Range: bytes {s}-{e}/{total}\r\nContent-Length: {}\r\n\r\n",
                 e - s + 1
             ),
             &body[s..=e],
         ),
         _ => (
             format!(
-                "HTTP/1.1 200 OK\r\n{}{etag_line}Content-Length: {total}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 200 OK\r\n{}{etag_line}Content-Length: {total}\r\n\r\n",
                 if bh.ranges { "Accept-Ranges: bytes\r\n" } else { "" }
             ),
             &body[..],
@@ -137,12 +153,13 @@ async fn serve(mut sock: tokio::net::TcpStream, body: Arc<Vec<u8>>, bh: Arc<Beha
     };
 
     sock.write_all(head.as_bytes()).await?;
-    // troncamento: chiude a metà corpo pur avendo annunciato Content-Length
-    let cut = bh.truncate.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
+    // troncamento: chiude a metà corpo pur avendo annunciato Content-Length.
+    // La connessione va poi chiusa davvero, altrimenti resterebbe disallineata.
+    let cut = !in_grace && bh.truncate.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1)).is_ok();
     let out = if cut && slice.len() > 1 { &slice[..slice.len() / 2] } else { slice };
     sock.write_all(out).await?;
     sock.flush().await?;
-    Ok(())
+    Ok(!cut)
 }
 
 /// "bytes=100-199" -> (100, 199), estremi inclusivi e clampati.
@@ -250,17 +267,10 @@ async fn rate_limiting_shrinks_concurrency_but_completes() {
     let srv = spawn_server(body.clone(), bh.clone()).await;
     let fx = Fixture::new("429");
 
-    // il probe passa, poi i primi segmenti sbattono contro il rate limit
+    // il probe passa (grazia 1), poi i segmenti sbattono contro il rate limit
     bh.retry_after.store(true, Ordering::SeqCst);
-    tokio::spawn({
-        let bh = bh.clone();
-        async move {
-            while bh.hits.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            bh.rate_limit.store(6, Ordering::SeqCst);
-        }
-    });
+    bh.grace.store(1, Ordering::SeqCst);
+    bh.rate_limit.store(6, Ordering::SeqCst);
 
     engine::run_job(fx.state.clone(), fx.job(&srv.url)).await;
 
@@ -277,16 +287,10 @@ async fn truncated_response_is_retried_without_holes() {
     let fx = Fixture::new("trunc");
 
     // le prime risposte-segmento si chiudono a metà: senza il controllo di
-    // troncamento il file finale resterebbe bucato
-    tokio::spawn({
-        let bh = bh.clone();
-        async move {
-            while bh.hits.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-            }
-            bh.truncate.store(4, Ordering::SeqCst);
-        }
-    });
+    // troncamento (e senza il flush sull'errore di stream) il file finale
+    // resterebbe bucato
+    bh.grace.store(1, Ordering::SeqCst); // il probe passa intero
+    bh.truncate.store(4, Ordering::SeqCst);
 
     engine::run_job(fx.state.clone(), fx.job(&srv.url)).await;
 
@@ -355,15 +359,8 @@ async fn file_changed_on_server_fails_instead_of_corrupting() {
 
     // subito dopo il probe il server passa a un'altra versione del file:
     // If-Range non combacia più e le richieste Range tornano 200
-    tokio::spawn({
-        let bh = bh.clone();
-        async move {
-            while bh.hits.load(Ordering::SeqCst) == 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-            }
-            *bh.etag.lock().unwrap() = Some("\"v2\"".into());
-        }
-    });
+    bh.grace.store(1, Ordering::SeqCst);
+    *bh.etag_after_grace.lock().unwrap() = Some("\"v2\"".into());
 
     engine::run_job(fx.state.clone(), fx.job(&srv.url)).await;
 
@@ -374,6 +371,31 @@ async fn file_changed_on_server_fails_instead_of_corrupting() {
     }
     // il punto: nessun file "buono" consegnato all'utente
     assert!(!dl.path.lock().unwrap().exists(), "non deve esistere un file finale da byte misti");
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn second_download_reuses_pooled_connections() {
+    let body = Arc::new(make_body(BIG));
+    let bh = behavior(true, Some("\"v1\""));
+    let srv = spawn_server(body.clone(), bh.clone()).await;
+    let fx = Fixture::new("pool");
+
+    engine::run_job(fx.state.clone(), fx.job(&format!("{}?a=1", srv.url))).await;
+    let after_first = bh.conns.load(Ordering::SeqCst);
+    assert!(after_first > 0);
+
+    engine::run_job(fx.state.clone(), fx.job(&format!("{}?a=2", srv.url))).await;
+    let opened_by_second = bh.conns.load(Ordering::SeqCst) - after_first;
+
+    let segments = fx.state.downloads.lock().unwrap()[1].segs.lock().unwrap().len() as u64;
+    // Il punto: senza cache del client ogni download ricostruiva il pool da
+    // zero, quindi il secondo riapriva almeno una connessione per segmento
+    // (piu' il probe). Con il riuso ne apre meno.
+    assert!(
+        opened_by_second < segments + 1,
+        "nessun riuso: il secondo download ha aperto {opened_by_second} connessioni per {segments} segmenti"
+    );
+    assert_eq!(fx.output(), *srv.body);
 }
 
 #[tokio::test(flavor = "multi_thread")]

@@ -13,6 +13,11 @@ use reqwest::header::{
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncSeekExt, AsyncWriteExt};
 
+/// UA per i job senza uno proprio (URL incollato a mano). Quelli che arrivano
+/// dall'estensione portano il UA vero di Chrome. Era fisso a "mdm/0.2", che
+/// non corrispondeva più alla versione da un pezzo.
+const DEFAULT_UA: &str = concat!("mdm/", env!("CARGO_PKG_VERSION"));
+
 /// Tetto assoluto delle connessioni: la config non può superarlo.
 pub const MAX_CONNECTIONS: u64 = crate::config::MAX_CONNECTIONS_CAP;
 const MAX_SEGMENTS: u64 = MAX_CONNECTIONS;
@@ -189,6 +194,8 @@ pub struct AppState {
     pub hwnd: std::sync::atomic::AtomicIsize,
     pub egui_ctx: Mutex<Option<eframe::egui::Context>>,
     pub rt: Mutex<Option<tokio::runtime::Handle>>,
+    /// client HTTP per user-agent: riusa pool di connessioni e sessioni TLS
+    pub clients: Mutex<std::collections::HashMap<String, reqwest::Client>>,
     /// impostazioni persistite: cartella, connessioni, banda, memoria per host
     pub config: Arc<crate::config::Store>,
     /// limite di banda globale (0 = illimitato)
@@ -215,14 +222,34 @@ const LOG_MAX_BYTES: u64 = 2 * 1024 * 1024;
 /// Append su file con rotazione singola. Con `windows_subsystem = "windows"`
 /// stderr non esiste e il log in RAM muore col processo: senza questo, dei bug
 /// rari non resta traccia.
+///
+/// L'handle resta aperto: riaprire il file a ogni riga significava due syscall
+/// in più per riga, su thread del runtime tokio.
 fn append_log_file(line: &str) {
     use std::io::Write as _;
-    let path = log_path();
-    if std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) > LOG_MAX_BYTES {
-        let _ = std::fs::rename(&path, path.with_extension("log.1"));
+    static FILE: std::sync::OnceLock<Mutex<Option<(std::fs::File, u64)>>> = std::sync::OnceLock::new();
+    let slot = FILE.get_or_init(|| Mutex::new(None));
+    let Ok(mut guard) = slot.lock() else { return };
+
+    if guard.is_none() {
+        let path = log_path();
+        let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let Ok(f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) else { return };
+        *guard = Some((f, size));
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(f, "{} {line}", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    let Some((file, written)) = guard.as_mut() else { return };
+
+    let text = format!("{} {line}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    if file.write_all(text.as_bytes()).is_err() {
+        *guard = None; // handle andato: si riapre al prossimo giro
+        return;
+    }
+    *written += text.len() as u64;
+
+    if *written > LOG_MAX_BYTES {
+        let path = log_path();
+        *guard = None; // chiudi prima di rinominare
+        let _ = std::fs::rename(&path, path.with_extension("log.1"));
     }
 }
 
@@ -460,7 +487,7 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
         dl.done.store(sum, Ordering::Relaxed);
         *dl.status.lock().unwrap() = Status::Active;
         state.repaint();
-        let (client, headers) = build_client(&job);
+        let (client, headers) = client_for(&state, &job);
         let r =
             run_segments(&client, &job.url, &headers, &part, &dl, remembered_conc(&state, &job.url), state.max_conc())
                 .await;
@@ -624,7 +651,7 @@ fn sweep_orphans(state: &AppState, dir: &Path) {
 }
 
 async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) -> anyhow::Result<PathBuf> {
-    let (client, headers) = build_client(job);
+    let (client, headers) = client_for(state, job);
 
     // probe: GET con Range 0-0. 206 => range supportati + totale da Content-Range;
     // 200 => niente range, ma la risposta è il file intero e la riusiamo come stream.
@@ -663,6 +690,7 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
         .get(CONTENT_DISPOSITION)
         .and_then(|v| v.to_str().ok())
         .and_then(filename_from_disposition);
+    let http_version = probe.version();
     let ranges = probe.status() == reqwest::StatusCode::PARTIAL_CONTENT;
     let len: Option<u64> = if ranges {
         probe
@@ -729,6 +757,7 @@ async fn download(state: &AppState, dl: &Arc<Download>, job: &Job, fresh: bool) 
             .collect();
         // se questo host ha già protestato (429), riparti prudente
         let start_conc = remembered_conc(state, &job.url);
+        state.log(format!("protocollo negoziato: {:?}", http_version));
         if segs.len() == 1 {
             state.log(format!("1 connessione ({}), resume disponibile", crate::ui::fmt_bytes(len)));
         } else if start_conc < max_conc {
@@ -807,21 +836,27 @@ pub fn system_proxy() -> Option<String> {
     None
 }
 
-fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
-    let ua = if job.user_agent.is_empty() { "mdm/0.2".to_string() } else { job.user_agent.clone() };
-    let mut builder = reqwest::Client::builder()
-        .user_agent(ua)
-        .connect_timeout(std::time::Duration::from_secs(20))
-        .tcp_keepalive(std::time::Duration::from_secs(30))
-        .pool_max_idle_per_host(MAX_SEGMENTS as usize);
-    if let Some(p) = system_proxy() {
-        if let Ok(proxy) = reqwest::Proxy::all(&p) {
-            // il proxy aziendale non deve inghiottire localhost e intranet,
-            // altrimenti i download da host locali falliscono sempre
-            builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")));
+/// Client HTTP riusabile. La cache è per user-agent: cookie e referer viaggiano
+/// negli header della singola richiesta, quindi due job con lo stesso UA
+/// possono condividere pool di connessioni e sessioni TLS.
+///
+/// Senza cache ogni download — e ogni singolo resume — rifaceva da zero tutti
+/// gli handshake TLS.
+fn client_for(state: &AppState, job: &Job) -> (reqwest::Client, HeaderMap) {
+    let ua = if job.user_agent.is_empty() { DEFAULT_UA.to_string() } else { job.user_agent.clone() };
+    let cached = state.clients.lock().unwrap().get(&ua).cloned();
+    let client = match cached {
+        Some(c) => c,
+        None => {
+            let c = build_client_inner(&ua, state.max_conc());
+            state.clients.lock().unwrap().insert(ua, c.clone());
+            c
         }
-    }
-    let client = builder.build().expect("client http");
+    };
+    (client, request_headers(job))
+}
+
+fn request_headers(job: &Job) -> HeaderMap {
     let mut headers = HeaderMap::new();
     if !job.cookies.is_empty() {
         if let Ok(v) = HeaderValue::from_str(&job.cookies) {
@@ -833,7 +868,31 @@ fn build_client(job: &Job) -> (reqwest::Client, HeaderMap) {
             headers.insert(REFERER, v);
         }
     }
-    (client, headers)
+    headers
+}
+
+fn build_client_inner(ua: &str, max_conc: u64) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(ua)
+        .connect_timeout(std::time::Duration::from_secs(20))
+        .tcp_keepalive(std::time::Duration::from_secs(30))
+        // tenere aperte le connessioni dei segmenti tra un tentativo e l'altro
+        .pool_idle_timeout(std::time::Duration::from_secs(90))
+        .pool_max_idle_per_host(max_conc.max(1) as usize)
+        // molti WAF guardano male una richiesta senza Accept
+        .default_headers({
+            let mut h = HeaderMap::new();
+            h.insert(reqwest::header::ACCEPT, HeaderValue::from_static("*/*"));
+            h
+        });
+    if let Some(p) = system_proxy() {
+        if let Ok(proxy) = reqwest::Proxy::all(&p) {
+            // il proxy aziendale non deve inghiottire localhost e intranet,
+            // altrimenti i download da host locali falliscono sempre
+            builder = builder.proxy(proxy.no_proxy(reqwest::NoProxy::from_string("localhost,127.0.0.1,::1")));
+        }
+    }
+    builder.build().expect("client http")
 }
 
 /// Limita la concorrenza con AIMD vero: sui 429 dimezza (8→4→2→1),
@@ -1008,7 +1067,7 @@ async fn run_segments(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(SIDECAR_EVERY).await;
-                let _ = write_sidecar(&dl, &part);
+                write_sidecar_async(&dl, &part).await;
             }
         })
     };
@@ -1273,7 +1332,8 @@ async fn single_stream(
     Ok(())
 }
 
-fn write_sidecar(dl: &Download, part: &Path) -> anyhow::Result<()> {
+/// Snapshot serializzato dello stato, da scrivere su disco.
+fn sidecar_bytes(dl: &Download) -> anyhow::Result<Vec<u8>> {
     let sc = Sidecar {
         job: dl.job.lock().unwrap().clone(),
         total: dl.total.load(Ordering::Relaxed),
@@ -1288,8 +1348,23 @@ fn write_sidecar(dl: &Download, part: &Path) -> anyhow::Result<()> {
             .map(|s| SegSave { start: s.start, end: s.end(), done: s.flushed.load(Ordering::Relaxed).min(s.len()) })
             .collect(),
     };
-    std::fs::write(sidecar_path(part), serde_json::to_vec(&sc)?)?;
+    Ok(serde_json::to_vec(&sc)?)
+}
+
+/// Versione sincrona, per i punti che già non sono nel percorso caldo
+/// (fine download, pausa, abort).
+fn write_sidecar(dl: &Download, part: &Path) -> anyhow::Result<()> {
+    std::fs::write(sidecar_path(part), sidecar_bytes(dl)?)?;
     Ok(())
+}
+
+/// Versione per il salvataggio periodico: la scrittura va su un thread
+/// bloccante, non su un worker del runtime dove fermerebbe anche i segmenti
+/// che stanno scaricando su quello stesso thread.
+async fn write_sidecar_async(dl: &Download, part: &Path) {
+    let Ok(bytes) = sidecar_bytes(dl) else { return };
+    let path = sidecar_path(part);
+    let _ = tokio::task::spawn_blocking(move || std::fs::write(path, bytes)).await;
 }
 
 fn host_of(url: &str) -> String {

@@ -508,12 +508,23 @@ impl App {
     fn update_title(&mut self, ctx: &egui::Context, downloads: &[Arc<Download>], n_active: usize, speed: f64) {
         use crate::taskbar;
 
-        let (done, total) = downloads
-            .iter()
-            .filter(|d| matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting))
-            .fold((0u64, 0u64), |(d0, t0), d| {
-                (d0 + d.done.load(Ordering::Relaxed), t0 + d.total.load(Ordering::Relaxed))
-            });
+        // una passata sola: ogni lock di stato qui contende con i worker che
+        // stanno scaricando, e questo gira fino a 15 volte al secondo
+        let mut done = 0u64;
+        let mut total = 0u64;
+        let mut any_failed = false;
+        let mut any_paused = false;
+        for d in downloads {
+            match &*d.status.lock().unwrap() {
+                Status::Active | Status::Connecting => {
+                    done += d.done.load(Ordering::Relaxed);
+                    total += d.total.load(Ordering::Relaxed);
+                }
+                Status::Failed(_) => any_failed = true,
+                Status::Paused => any_paused = true,
+                _ => {}
+            }
+        }
 
         let title = if n_active == 0 {
             "MDM".to_string()
@@ -529,8 +540,6 @@ impl App {
 
         // barra sull'icona della taskbar: rossa se qualcosa è fallito,
         // gialla se è tutto in pausa, verde mentre scarica
-        let any_failed = downloads.iter().any(|d| matches!(*d.status.lock().unwrap(), Status::Failed(_)));
-        let any_paused = downloads.iter().any(|d| matches!(*d.status.lock().unwrap(), Status::Paused));
         let (tb_state, tb_done, tb_total) = if n_active > 0 && total > 0 {
             (taskbar::TBPF_NORMAL, done, total)
         } else if any_failed {
