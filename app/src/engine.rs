@@ -348,46 +348,57 @@ pub async fn run_job(state: Arc<AppState>, job: Job) {
     state.log(format!("nuovo job: {}", job.url));
     state.wake_and_show();
 
-    // attesa del turno: con la coda piena questo download resta Queued
+    {
+        let Some(_slot) = await_turn(&state, &dl).await else { return };
+        let result = download(&state, &dl, &job, true).await;
+        finish(&state, &dl, result);
+    }
+    // slot rilasciato prima dei retry: aspettare 45s di backoff tenendo
+    // occupato un posto in coda bloccherebbe gli altri download per niente
+    // (ed essendo `resume` a riprenderlo, con limite 1 sarebbe un deadlock)
+    retry_loop(&state, &dl).await;
+}
+
+/// Mette il download in coda e aspetta il suo turno, aggiornando la posizione
+/// mostrata. `None` = annullato mentre aspettava.
+///
+/// Ci passano sia i job nuovi sia i resume: senza, "riprendi tutti" farebbe
+/// ripartire tutto insieme scavalcando il limite di download simultanei.
+async fn await_turn<'a>(state: &'a Arc<AppState>, dl: &Arc<Download>) -> Option<crate::queue::Slot<'a>> {
+    *dl.status.lock().unwrap() = Status::Queued;
     let ticket = state.queue.ticket();
-    let slot = {
+    let pos = state.queue.position(ticket);
+    dl.queue_pos.store(pos, Ordering::Relaxed);
+    if pos > 0 {
+        state.log(format!("in coda ({pos} davanti): {}", dl.name.lock().unwrap()));
+    }
+    state.repaint();
+
+    // tiene viva la posizione mostrata mentre si aspetta
+    let ticker = {
         let dl = dl.clone();
-        let state2 = state.clone();
-        let pos = state.queue.position(ticket);
-        if pos > 0 {
-            dl.queue_pos.store(pos, Ordering::Relaxed);
-            state.log(format!("in coda ({pos} davanti): {}", dl.name.lock().unwrap()));
-            state.repaint();
-        }
-        // aggiorna la posizione mostrata mentre si aspetta
-        let ticker = {
-            let dl = dl.clone();
-            let state = state2.clone();
-            tokio::spawn(async move {
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    dl.queue_pos.store(state.queue.position(ticket), Ordering::Relaxed);
-                    state.repaint();
-                }
-            })
-        };
-        let slot = state.queue.enter(ticket, || dl.cancel.load(Ordering::Relaxed)).await;
-        ticker.abort();
-        slot
+        let state = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+                dl.queue_pos.store(state.queue.position(ticket), Ordering::Relaxed);
+                state.repaint();
+            }
+        })
     };
-    let Some(_slot) = slot else {
+    let slot = state.queue.enter(ticket, || dl.cancel.load(Ordering::Relaxed)).await;
+    ticker.abort();
+    dl.queue_pos.store(0, Ordering::Relaxed);
+
+    if slot.is_none() {
         *dl.status.lock().unwrap() = Status::Cancelled;
         state.log(format!("annullato in coda: {}", dl.name.lock().unwrap()));
         state.repaint();
-        return;
-    };
-    dl.queue_pos.store(0, Ordering::Relaxed);
+        return None;
+    }
     *dl.status.lock().unwrap() = Status::Connecting;
     state.repaint();
-
-    let result = download(&state, &dl, &job, true).await;
-    finish(&state, &dl, result);
-    retry_loop(&state, &dl).await;
+    slot
 }
 
 /// Ritenta da solo un download fallito, con backoff crescente. Gli errori
@@ -428,6 +439,10 @@ pub async fn resume(state: Arc<AppState>, dl: Arc<Download>) {
     dl.fatal.store(false, Ordering::Relaxed);
     state.log(format!("riprendo: {}", dl.name.lock().unwrap()));
     state.repaint();
+
+    // anche i resume passano dalla coda: "riprendi tutti" su 20 download in
+    // pausa non deve farne ripartire 20 insieme
+    let Some(_slot) = await_turn(&state, &dl).await else { return };
 
     let job = dl.job.lock().unwrap().clone();
     let part = part_path(&dl.path.lock().unwrap());
@@ -547,6 +562,7 @@ pub fn discard(dl: &Download) {
 /// All'avvio: cerca sidecar in Downloads e ricrea i download in pausa.
 pub fn scan_resumable(state: &Arc<AppState>) {
     let Ok(dir) = state.dl_dir() else { return };
+    sweep_orphans(state, &dir);
     let Ok(rd) = std::fs::read_dir(&dir) else { return };
     for entry in rd.flatten() {
         let sc_path = entry.path();
@@ -578,6 +594,32 @@ pub fn scan_resumable(state: &Arc<AppState>) {
         *dl.status.lock().unwrap() = Status::Paused;
         state.log(format!("ripristinato dal disco: {} (riprendi quando vuoi)", dl.name.lock().unwrap()));
         state.downloads.lock().unwrap().push(dl);
+    }
+}
+
+/// `.part` senza sidecar: nessuno saprà mai riprenderli.
+///
+/// Quelli vuoti (nome riservato da `reserve_path` e download morto subito
+/// dopo) si cancellano: sono spazzatura certa. Quelli con dei byte dentro si
+/// segnalano soltanto — cancellare roba dell'utente non è compito nostro.
+fn sweep_orphans(state: &AppState, dir: &Path) {
+    let Ok(rd) = std::fs::read_dir(dir) else { return };
+    let mut stale = 0;
+    for entry in rd.flatten() {
+        let path = entry.path();
+        if path.extension().is_none_or(|e| e != "part") || sidecar_path(&path).exists() {
+            continue;
+        }
+        match entry.metadata().map(|m| m.len()) {
+            Ok(0) => {
+                let _ = std::fs::remove_file(&path);
+            }
+            Ok(_) => stale += 1,
+            Err(_) => {}
+        }
+    }
+    if stale > 0 {
+        state.log(format!("{stale} file .part senza stato in Downloads: non riprendibili, puoi cancellarli"));
     }
 }
 
@@ -839,6 +881,12 @@ impl Gate {
         self.notify.notify_waiters();
     }
 
+    /// C'è uno slot libero adesso? Serve a non rubare lavoro che poi resterebbe
+    /// fermo in attesa del gate.
+    fn has_room(&self) -> bool {
+        self.active.load(Ordering::SeqCst) < self.max.load(Ordering::SeqCst)
+    }
+
     fn shrink(&self) -> u64 {
         let mut new = 1;
         let _ = self.max.fetch_update(Ordering::SeqCst, Ordering::SeqCst, |m| {
@@ -927,14 +975,25 @@ async fn run_segments(
         let queue = queue.clone();
         tasks.push(tokio::spawn(async move {
             loop {
-                let seg = {
-                    let popped = queue.lock().unwrap().pop_front();
-                    match popped {
-                        Some(s) => s,
-                        None => match steal_segment(&mut dl.segs.lock().unwrap()) {
+                let popped = queue.lock().unwrap().pop_front();
+                let seg = match popped {
+                    Some(s) => s,
+                    None => {
+                        // Rubare senza avere uno slot libero spezzetta il file
+                        // per niente: con l'AIMD sceso a 1 connessione, gli
+                        // altri 7 worker dimezzerebbero i segmenti a ripetizione
+                        // restando poi fermi sul gate.
+                        if !gate.has_room() {
+                            if dl.interrupted() {
+                                return Ok(());
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                            continue;
+                        }
+                        match steal_segment(&mut dl.segs.lock().unwrap()) {
                             Some(s) => s,
                             None => return Ok(()), // niente più lavoro
-                        },
+                        }
                     }
                 };
                 work_segment(&client, &url, &headers, &path, &seg, &dl, &gate).await?;
@@ -1357,8 +1416,14 @@ fn filename_from_disposition(v: &str) -> Option<String> {
     for part in v.split(';') {
         let p = part.trim();
         if let Some(rest) = p.strip_prefix("filename*=") {
-            let rest = rest.trim_start_matches("UTF-8''").trim_start_matches("utf-8''");
-            return Some(percent_decode(rest.trim_matches('"')));
+            // RFC 5987: charset'lingua'valore. La lingua è quasi sempre vuota
+            // ("UTF-8''nome") ma quando c'è va scartata, non incollata al nome.
+            let rest = rest.trim_matches('"');
+            let value = match rest.split_once('\'') {
+                Some((_charset, tail)) => tail.split_once('\'').map(|(_lang, v)| v).unwrap_or(tail),
+                None => rest,
+            };
+            return Some(percent_decode(value));
         }
         if let Some(rest) = p.strip_prefix("filename=") {
             return Some(rest.trim_matches('"').to_string());
@@ -1464,6 +1529,9 @@ mod tests {
     fn disposition_names() {
         assert_eq!(filename_from_disposition(r#"attachment; filename="a b.zip""#), Some("a b.zip".into()));
         assert_eq!(filename_from_disposition("attachment; filename*=UTF-8''a%20b.zip"), Some("a b.zip".into()));
+        // con il tag di lingua valorizzato: va scartato, non finire nel nome
+        assert_eq!(filename_from_disposition("attachment; filename*=UTF-8'it'relazione%202024.pdf"), Some("relazione 2024.pdf".into()));
+        assert_eq!(filename_from_disposition("attachment; filename*=iso-8859-1'en'file.zip"), Some("file.zip".into()));
         assert_eq!(filename_from_disposition("inline"), None);
     }
 

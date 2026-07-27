@@ -123,7 +123,27 @@ async fn apply_inner(state: &Arc<AppState>) -> anyhow::Result<()> {
     for dl in state.downloads.lock().unwrap().iter() {
         dl.pause.store(true, Ordering::Relaxed);
     }
-    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    // aspetta la pausa vera invece di un tempo fisso: un disco lento o un
+    // segmento grosso da flushare impiegano piu' di 1200ms, e tagliare li'
+    // significherebbe perdere il progresso appena fatto
+    for _ in 0..100 {
+        let pending = state
+            .downloads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| {
+                matches!(
+                    *d.status.lock().unwrap(),
+                    crate::engine::Status::Active | crate::engine::Status::Connecting
+                )
+            })
+            .count();
+        if pending == 0 {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
 
     state.log(format!("installo {version} e riavvio..."));
     state.repaint();

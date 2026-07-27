@@ -148,6 +148,9 @@ struct App {
     show_history: bool,
     /// ultimo titolo impostato, per non spammare il comando alla viewport
     last_title: String,
+    /// stato+percentuale già mandati alla taskbar, per non richiamare COM a vuoto
+    last_taskbar: u64,
+    taskbar_warned: bool,
     #[cfg(windows)]
     tray: Option<Tray>,
     quitting: bool,
@@ -171,6 +174,8 @@ impl App {
             history: crate::history::load(),
             show_history: false,
             last_title: "MDM".to_string(),
+            last_taskbar: u64::MAX,
+            taskbar_warned: false,
             #[cfg(windows)]
             tray: Tray::build(state),
             quitting: false,
@@ -501,24 +506,52 @@ impl App {
     /// della taskbar e in Alt-Tab, quindi il progresso si legge anche con la
     /// finestra coperta. Aggiornato solo quando cambia, non a ogni frame.
     fn update_title(&mut self, ctx: &egui::Context, downloads: &[Arc<Download>], n_active: usize, speed: f64) {
+        use crate::taskbar;
+
+        let (done, total) = downloads
+            .iter()
+            .filter(|d| matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting))
+            .fold((0u64, 0u64), |(d0, t0), d| {
+                (d0 + d.done.load(Ordering::Relaxed), t0 + d.total.load(Ordering::Relaxed))
+            });
+
         let title = if n_active == 0 {
             "MDM".to_string()
+        } else if total > 0 {
+            format!("MDM — {:.0}% · {}/s", done as f64 / total as f64 * 100.0, fmt_bytes(speed as u64))
         } else {
-            let (done, total) = downloads
-                .iter()
-                .filter(|d| matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting))
-                .fold((0u64, 0u64), |(d0, t0), d| {
-                    (d0 + d.done.load(Ordering::Relaxed), t0 + d.total.load(Ordering::Relaxed))
-                });
-            if total > 0 {
-                format!("MDM — {:.0}% · {}/s", done as f64 / total as f64 * 100.0, fmt_bytes(speed as u64))
-            } else {
-                format!("MDM — {}/s", fmt_bytes(speed as u64))
-            }
+            format!("MDM — {}/s", fmt_bytes(speed as u64))
         };
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
+        }
+
+        // barra sull'icona della taskbar: rossa se qualcosa è fallito,
+        // gialla se è tutto in pausa, verde mentre scarica
+        let any_failed = downloads.iter().any(|d| matches!(*d.status.lock().unwrap(), Status::Failed(_)));
+        let any_paused = downloads.iter().any(|d| matches!(*d.status.lock().unwrap(), Status::Paused));
+        let (tb_state, tb_done, tb_total) = if n_active > 0 && total > 0 {
+            (taskbar::TBPF_NORMAL, done, total)
+        } else if any_failed {
+            (taskbar::TBPF_ERROR, 1, 1)
+        } else if any_paused {
+            (taskbar::TBPF_PAUSED, 1, 1)
+        } else {
+            (taskbar::TBPF_NOPROGRESS, 0, 0)
+        };
+        // percentuale intera: aggiornare a ogni frame è inutile e costa una
+        // chiamata COM per niente
+        let stamp = (tb_state as u64) << 8 | if tb_total > 0 { tb_done * 100 / tb_total } else { 0 };
+        if stamp != self.last_taskbar {
+            self.last_taskbar = stamp;
+            let ok = taskbar::set(self.state.hwnd.load(Ordering::Relaxed), tb_state, tb_done, tb_total);
+            // una volta sola: se la barra non c'è si deve poter capire dal log
+            // invece di restare a chiedersi perché non compare
+            if !ok && tb_state != taskbar::TBPF_NOPROGRESS && !self.taskbar_warned {
+                self.taskbar_warned = true;
+                self.state.log("barra di progresso sulla taskbar non disponibile");
+            }
         }
     }
 

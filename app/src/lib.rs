@@ -8,6 +8,7 @@ pub mod host;
 pub mod limiter;
 pub mod notify;
 pub mod queue;
+pub mod taskbar;
 pub mod server;
 pub mod ui;
 pub mod update;

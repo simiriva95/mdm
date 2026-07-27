@@ -30,7 +30,11 @@ notify-rust = "4"
 tray-icon = "0.19"
 winreg = "0.52"
 raw-window-handle = "0.6"
-windows-sys = { version = "0.59", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_System_Com",
+] }
 
 [profile.release]
 lto = true

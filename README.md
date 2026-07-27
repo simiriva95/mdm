@@ -15,7 +15,7 @@ Download manager minimale per Windows: intercetta i download grandi da Chrome e 
 - **UI "desktop di terminali"**: finestre navy con chrome `[X][+][_]`, gauge pastello, sparkline di rete, console log
 - File piccoli restano in Chrome (soglia configurabile / estensioni note); click sull'icona estensione = ON/OFF, tasto destro su un link = "Scarica con MDM"
 - Cookie + referer inoltrati: funzionano anche i download dietro login
-- Notifica di sistema a fine download, tooltip del tray con velocità, progresso nel titolo della finestra
+- Notifica di sistema a fine download, tooltip del tray con velocità, barra di progresso sull'icona nella taskbar (rossa se qualcosa è fallito, gialla in pausa)
 - Se l'app non risponde, il download torna automaticamente a Chrome: mai perso
 
 ## Configurazione

@@ -424,6 +424,57 @@ async fn queue_caps_how_many_run_at_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn resume_all_respects_the_queue_limit() {
+    let body = Arc::new(make_body(BIG));
+    let srv = spawn_server(body.clone(), behavior(true, Some("\"v1\""))).await;
+    let fx = Fixture::new("resumeq");
+    fx.state.config.edit(|c| c.max_concurrent_downloads = 3);
+    fx.state.apply_config();
+
+    // tre download avviati e messi in pausa a metà
+    let mut paused = Vec::new();
+    for i in 0..3 {
+        let job = fx.job(&format!("{}?r={i}", srv.url));
+        let task = tokio::spawn(engine::run_job(fx.state.clone(), job));
+        let dl = wait_for_nth(&fx.state, i, BIG as u64 / 16).await;
+        dl.pause.store(true, Ordering::Relaxed);
+        task.await.unwrap();
+        paused.push(dl);
+    }
+    assert!(paused.iter().all(|d| matches!(*d.status.lock().unwrap(), Status::Paused)));
+
+    // "riprendi tutti" con limite 1: devono ripartire uno alla volta
+    fx.state.config.edit(|c| c.max_concurrent_downloads = 1);
+    fx.state.apply_config();
+    let tasks: Vec<_> =
+        paused.iter().map(|d| tokio::spawn(engine::resume(fx.state.clone(), d.clone()))).collect();
+
+    for _ in 0..600 {
+        let active = fx
+            .state
+            .downloads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|d| matches!(*d.status.lock().unwrap(), Status::Active | Status::Connecting))
+            .count();
+        assert!(active <= 1, "resume ha scavalcato la coda: {active} attivi con limite 1");
+        if tasks.iter().all(|t| t.is_finished()) {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    for t in tasks {
+        t.await.unwrap();
+    }
+
+    for d in &paused {
+        assert!(matches!(*d.status.lock().unwrap(), Status::Done));
+        assert_eq!(std::fs::read(d.path.lock().unwrap().clone()).unwrap(), *srv.body);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn dead_link_fails_once_without_retrying() {
     let body = Arc::new(make_body(1024));
     let bh = behavior(true, None);
@@ -449,15 +500,20 @@ async fn dead_link_fails_once_without_retrying() {
 }
 
 async fn wait_for_progress(state: &Arc<AppState>, bytes: u64) -> Arc<engine::Download> {
+    wait_for_nth(state, 0, bytes).await
+}
+
+/// Aspetta che il download in posizione `n` abbia scaricato almeno `bytes`.
+async fn wait_for_nth(state: &Arc<AppState>, n: usize, bytes: u64) -> Arc<engine::Download> {
     for _ in 0..2000 {
-        if let Some(dl) = state.downloads.lock().unwrap().first().cloned() {
+        if let Some(dl) = state.downloads.lock().unwrap().get(n).cloned() {
             if dl.done.load(Ordering::Relaxed) >= bytes {
                 return dl;
             }
         }
         tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
-    panic!("il download non ha raggiunto {bytes} byte in tempo");
+    panic!("il download {n} non ha raggiunto {bytes} byte in tempo");
 }
 
 fn label(s: &Status) -> String {
