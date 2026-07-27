@@ -153,18 +153,30 @@ async fn apply_inner(state: &Arc<AppState>) -> anyhow::Result<()> {
         use std::os::windows::process::CommandExt;
         const CREATE_NO_WINDOW: u32 = 0x0800_0000;
         let exe = std::env::current_exe()?;
-        // aspetta la nostra uscita, installa silenzioso, rilancia
-        std::process::Command::new("cmd")
-            .args([
-                "/C",
-                &format!(
-                    "timeout /t 2 /nobreak >nul & \"{}\" /VERYSILENT /SUPPRESSMSGBOXES & start \"\" \"{}\"",
-                    setup.display(),
-                    exe.display()
-                ),
-            ])
-            .creation_flags(CREATE_NO_WINDOW)
-            .spawn()?;
+
+        // Lo script sta su file e viene passato come argomento singolo.
+        // Comporre a mano una riga `cmd /C "... \"...\" ..."` non funziona:
+        // Command sfugge le virgolette interne con la backslash, che cmd non
+        // interpreta (usa ^). Il risultato era che cmd riceveva `start \"\"` e
+        // provava ad aprire `\`, con la finestra "Impossibile trovare '\'",
+        // senza nemmeno lanciare l'installer.
+        let script = std::env::temp_dir().join("mdm-update.cmd");
+        std::fs::write(&script, update_script(&setup, &exe))?;
+
+        // output dello script su file: un aggiornamento che fallisce succede
+        // dopo che siamo usciti, quindi senza questo non resterebbe traccia
+        let script_log = crate::engine::data_dir().join("update.log");
+        let log = std::fs::File::create(&script_log).ok();
+        state.log(format!("aggiornamento in corso, log in {}", script_log.display()));
+
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.arg("/C").arg(&script).creation_flags(CREATE_NO_WINDOW);
+        if let Some(log) = log {
+            if let Ok(err) = log.try_clone() {
+                cmd.stdout(log).stderr(err);
+            }
+        }
+        cmd.spawn()?;
     }
 
     state.quit.store(true, Ordering::Relaxed);
@@ -172,9 +184,54 @@ async fn apply_inner(state: &Arc<AppState>) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Script che aspetta la nostra uscita, installa in silenzio e rilancia l'app.
+/// Dentro un file batch le virgolette sono quelle normali di cmd, quindi i
+/// percorsi con spazi funzionano senza acrobazie di escaping.
+///
+/// Due dettagli imparati a forza di provarlo:
+/// - `timeout` vuole un handle di console e qui non c'è (CREATE_NO_WINDOW):
+///   falliva con "il reindirizzamento dell'input non è supportato". `ping`
+///   fa da attesa e non ha quel vincolo.
+/// - `start` senza console non lancia niente e non dice niente. L'app viene
+///   quindi eseguita direttamente. Normalmente ci pensa già l'installer
+///   (vedi `Check: WizardSilent` in installer.iss) e questa riga trova la
+///   porta occupata, esce subito e chiude anche il cmd; se invece
+///   l'installer è vecchio e non rilancia, è questa a rimettere in piedi
+///   l'app. Il guard di istanza singola rende innocua la sovrapposizione.
+#[cfg_attr(not(windows), allow(dead_code))]
+fn update_script(setup: &std::path::Path, exe: &std::path::Path) -> String {
+    format!(
+        "@echo off\r\n\
+         ping -n 3 127.0.0.1 >nul\r\n\
+         \"{setup}\" /VERYSILENT /SUPPRESSMSGBOXES\r\n\
+         \"{exe}\"\r\n",
+        setup = setup.display(),
+        exe = exe.display()
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn script_quotes_paths_with_spaces() {
+        let s = update_script(
+            std::path::Path::new(r"C:\Users\a b\AppData\Local\Temp\mdm-setup.exe"),
+            std::path::Path::new(r"C:\Program Files\MDM\mdm.exe"),
+        );
+        // percorsi tra virgolette normali: dentro un .cmd non serve escaping
+        assert!(s.contains("\"C:\\Users\\a b\\AppData\\Local\\Temp\\mdm-setup.exe\" /VERYSILENT"));
+        assert!(s.contains("\"C:\\Program Files\\MDM\\mdm.exe\""));
+        // la backslash prima di una virgoletta era la causa del bug: cmd non
+        // la interpreta come escape e finiva per aprire `\`
+        assert!(!s.contains("\\\""), "niente escaping alla Rust dentro lo script");
+        // `start` non lancia niente senza console, `timeout` senza console
+        // fallisce: entrambi verificati, entrambi fuori dallo script
+        assert!(!s.contains("start "), "start non funziona con CREATE_NO_WINDOW");
+        assert!(!s.contains("timeout "), "timeout richiede un handle di console");
+        assert!(s.starts_with("@echo off"));
+    }
 
     #[test]
     fn versions() {

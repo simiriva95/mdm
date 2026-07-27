@@ -64,3 +64,8 @@ end;
 [Run]
 Filename: "chrome.exe"; Parameters: "chrome://extensions"; Description: "Apri chrome://extensions per caricare l'estensione"; Flags: postinstall shellexec skipifsilent
 Filename: "{app}\mdm.exe"; Description: "Avvia MDM"; Flags: postinstall nowait skipifsilent
+; Aggiornamento automatico (/VERYSILENT): qui non c'e' nessuna finestra con la
+; casella "Avvia MDM", quindi a rimettere in piedi l'app deve pensarci
+; l'installer. Lo script di update non puo' usare `start`, che senza console
+; non lancia niente.
+Filename: "{app}\mdm.exe"; Flags: nowait; Check: WizardSilent
